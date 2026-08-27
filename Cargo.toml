@@ -1,0 +1,19 @@
+[package]
+name = "tpm-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["runtime", "verus"]
+runtime = []
+verus = ["dep:vstd"]
+
+[dependencies]
+# heapless = { version = "0.8", default-features = false }
+vstd = { version = "0.0.0-2026-07-27-0206", optional = true }
+
+# [lints.rust]
+# unexpected_cfgs = { level = "allow", check-cfg = ['cfg(verus_keep_ghost)'] }
+
+[package.metadata.verus]
+verify = true
