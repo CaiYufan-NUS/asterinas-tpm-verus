@@ -145,12 +145,11 @@ pub fn map_capability_handles(
     for i in 0..count {
         let h = read_be32(rsp, CAP_HANDLES_OFF + 4 * i);
         if is_transient_exec(h) {
-            if h != 0
-                && h != CTX_SAVED_SENTINEL
-                && let Some(v) = tbl.lookup(h)
-            {
-                write_be32(rsp, CAP_HANDLES_OFF + 4 * j, v);
-                j += 1;
+            if h != 0 && h != CTX_SAVED_SENTINEL {
+                if let Some(v) = tbl.lookup(h) {
+                    write_be32(rsp, CAP_HANDLES_OFF + 4 * j, v);
+                    j += 1;
+                }
             }
         } else {
             write_be32(rsp, CAP_HANDLES_OFF + 4 * j, h);
