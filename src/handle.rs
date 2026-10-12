@@ -2,55 +2,55 @@ use vstd::prelude::*;
 
 verus! {
 
-/// 上下文表与会话表的槽位数。
+/// Number of slots in the context table and the session table.
 pub const SLOTS: usize = 3;
 
-/// 句柄类型由最高字节区分。
+/// The handle type is distinguished by the most significant byte.
 pub const HANDLE_TYPE_MASK: u32 = 0xFF00_0000;
 
 pub const HT_HMAC_SESSION: u32 = 0x0200_0000;
 pub const HT_POLICY_SESSION: u32 = 0x0300_0000;
 pub const HT_TRANSIENT: u32 = 0x8000_0000;
 
-/// 上下文表里表示「已保存、尚未装载」的哨兵值。
+/// Sentinel in the context table meaning "saved, not yet loaded".
 pub const CTX_SAVED_SENTINEL: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
-// 编码规约
+// Encoding spec
 // ---------------------------------------------------------------------------
 
-/// 槽位 `i` 对应的虚拟句柄。
+/// The virtual handle corresponding to slot `i`.
 pub open spec fn vhandle_of(i: int) -> u32 {
     (0x80FF_FFFF - i) as u32
 }
 
-/// 从虚拟句柄反解槽位号。对非法输入返回的值会落在 `[0, SLOTS)` 之外。
+/// Recover the slot number from a virtual handle. For invalid input the returned value falls outside `[0, SLOTS)`.
 pub open spec fn slot_of(v: u32) -> int {
     0xFF_FFFF - ((v & 0xFF_FFFF) as int)
 }
 
-/// 是否属于瞬态对象句柄空间。
+/// Whether the handle belongs to the transient object handle space.
 pub open spec fn is_transient(h: u32) -> bool {
     (h & HANDLE_TYPE_MASK) == HT_TRANSIENT
 }
 
-/// 是否属于会话句柄空间（HMAC 或策略）。会话句柄**不做虚拟化**，
-/// 表里只登记它们以便统一保存 / 装载 / 释放。
+/// Whether the handle belongs to the session handle space (HMAC or policy). Session handles are **not virtualized**;
+/// the table only registers them so that save / load / release can be handled uniformly.
 pub open spec fn is_session(h: u32) -> bool {
     (h & HANDLE_TYPE_MASK) == HT_HMAC_SESSION
         || (h & HANDLE_TYPE_MASK) == HT_POLICY_SESSION
 }
 
-/// 可以被登记进上下文表的物理句柄：既不是空槽标记也不是哨兵。
+/// A physical handle that can be registered in the context table: neither the empty-slot marker nor the sentinel.
 pub open spec fn valid_phandle(h: u32) -> bool {
     h != 0 && h != CTX_SAVED_SENTINEL
 }
 
 // ---------------------------------------------------------------------------
-// 引理
+// Lemmas
 // ---------------------------------------------------------------------------
 
-/// 虚拟句柄一定是瞬态类型。
+/// A virtual handle is always of transient type.
 pub proof fn lemma_vhandle_is_transient(i: int)
     requires
         0 <= i < SLOTS,
@@ -67,7 +67,7 @@ pub proof fn lemma_vhandle_is_transient(i: int)
     }
 }
 
-/// 编码 / 解码往返一致。
+/// Encoding / decoding round trip is consistent.
 pub proof fn lemma_slot_roundtrip(i: int)
     requires
         0 <= i < SLOTS,
@@ -84,10 +84,10 @@ pub proof fn lemma_slot_roundtrip(i: int)
     }
 }
 
-/// **双射性的算术核心**：类型位与槽位位拼起来就是整个句柄，
-/// 所以两个瞬态句柄只要槽位相同就必然相等。
+/// **Arithmetic core of bijectivity**: the type bits and the slot bits together make up the whole handle,
+/// so two transient handles with the same slot are necessarily equal.
 ///
-/// 上层的「虚实映射是单射」直接由它推出，不必再碰位运算。
+/// The upper layer's "virtual-to-real mapping is injective" follows directly from it, with no further bit manipulation.
 pub proof fn lemma_transient_slot_injective(a: u32, b: u32)
     requires
         is_transient(a),
@@ -104,10 +104,10 @@ pub proof fn lemma_transient_slot_injective(a: u32, b: u32)
 }
 
 // ---------------------------------------------------------------------------
-// 可执行版本
+// Executable versions
 // ---------------------------------------------------------------------------
 
-pub fn vhandle_of_exec(i: usize) -> (r: u32)
+pub(crate) fn vhandle_of_exec(i: usize) -> (r: u32)
     requires
         i < SLOTS,
     ensures
@@ -120,8 +120,8 @@ pub fn vhandle_of_exec(i: usize) -> (r: u32)
     0x80FF_FFFFu32 - (i as u32)
 }
 
-/// 反解槽位号。返回 `usize`，越界由调用方用 `< SLOTS` 判断。
-pub fn slot_of_exec(v: u32) -> (r: usize)
+/// Recover the slot number. Returns `usize`; the caller checks out-of-range with `< SLOTS`.
+pub(crate) fn slot_of_exec(v: u32) -> (r: usize)
     ensures
         r as int == slot_of(v),
 {

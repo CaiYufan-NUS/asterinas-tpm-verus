@@ -3,10 +3,10 @@ use vstd::prelude::*;
 verus! {
 
 // ---------------------------------------------------------------------------
-// 编码方向：整数 -> 字节序列
+// Encoding direction: integer -> byte sequence
 // ---------------------------------------------------------------------------
 
-/// `v` 的大端序第 `i` 个字节（i ∈ [0,2)）。
+/// The `i`-th byte of `v` in big-endian order (i ∈ [0,2)).
 pub open spec fn be16_byte(v: u16, i: int) -> u8 {
     if i == 0 {
         ((v >> 8) & 0xff) as u8
@@ -15,7 +15,7 @@ pub open spec fn be16_byte(v: u16, i: int) -> u8 {
     }
 }
 
-/// `v` 的大端序第 `i` 个字节（i ∈ [0,4)）。
+/// The `i`-th byte of `v` in big-endian order (i ∈ [0,4)).
 pub open spec fn be32_byte(v: u32, i: int) -> u8 {
     if i == 0 {
         ((v >> 24) & 0xff) as u8
@@ -28,19 +28,19 @@ pub open spec fn be32_byte(v: u32, i: int) -> u8 {
     }
 }
 
-/// `u16 -> [u8; 2]` 的规约。用 `Seq::new` 而非 `seq![..]`，
-/// 这样 `be16_bytes(v)[k] == be16_byte(v, k)` 直接来自 vstd 公理。
+/// Spec for `u16 -> [u8; 2]`. Uses `Seq::new` rather than `seq![..]`,
+/// so that `be16_bytes(v)[k] == be16_byte(v, k)` follows directly from the vstd axioms.
 pub open spec fn be16_bytes(v: u16) -> Seq<u8> {
     Seq::new(2, |i: int| be16_byte(v, i))
 }
 
-/// `u32 -> [u8; 4]` 的规约。
+/// Spec for `u32 -> [u8; 4]`.
 pub open spec fn be32_bytes(v: u32) -> Seq<u8> {
     Seq::new(4, |i: int| be32_byte(v, i))
 }
 
 // ---------------------------------------------------------------------------
-// 解码方向：字节 -> 整数
+// Decoding direction: bytes -> integer
 // ---------------------------------------------------------------------------
 
 pub open spec fn be16_of(b0: u8, b1: u8) -> u16 {
@@ -52,7 +52,7 @@ pub open spec fn be32_of(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// 往返一致性（指南阶段 1 待证不变量之一：u32 -> be bytes -> u32 恒等）
+// Round-trip consistency (one of the invariants to prove in guide phase 1: u32 -> be bytes -> u32 is the identity)
 // ---------------------------------------------------------------------------
 
 pub proof fn lemma_be16_roundtrip(v: u16)
@@ -86,8 +86,8 @@ pub proof fn lemma_be32_roundtrip(v: u32)
     ;
 }
 
-/// 反方向：先解码再编码，还原出原来的字节。
-/// 解析路径（阶段 2 的响应解码）会用到。
+/// The reverse direction: decode first, then encode, recovering the original bytes.
+/// Used by the parsing path (response decoding in phase 2).
 pub proof fn lemma_be32_of_roundtrip(b0: u8, b1: u8, b2: u8, b3: u8)
     ensures
         be32_byte(be32_of(b0, b1, b2, b3), 0) == b0,
@@ -107,21 +107,27 @@ pub proof fn lemma_be32_of_roundtrip(b0: u8, b1: u8, b2: u8, b3: u8)
 }
 
 // ---------------------------------------------------------------------------
-// exec 侧：与规约逐字对应，无 external_body
+// Exec side: call the standard library's big-endian conversion directly
+//
+// The signature of `from_be_bytes` carries a const generic expression, so Verus cannot write
+// an `assume_specification` for it; `external_body` is therefore used here to pin the contract to the spec;
+// the only thing trusted is the semantics of the standard library's big-endian conversion itself.
 // ---------------------------------------------------------------------------
 
-pub fn be16_of_exec(b0: u8, b1: u8) -> (r: u16)
+#[verifier::external_body]
+pub(crate) fn be16_of_exec(b0: u8, b1: u8) -> (r: u16)
     ensures
         r == be16_of(b0, b1),
 {
-    ((b0 as u16) << 8) | (b1 as u16)
+    u16::from_be_bytes([b0, b1])
 }
 
-pub fn be32_of_exec(b0: u8, b1: u8, b2: u8, b3: u8) -> (r: u32)
+#[verifier::external_body]
+pub(crate) fn be32_of_exec(b0: u8, b1: u8, b2: u8, b3: u8) -> (r: u32)
     ensures
         r == be32_of(b0, b1, b2, b3),
 {
-    ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32)
+    u32::from_be_bytes([b0, b1, b2, b3])
 }
 
 } // verus!

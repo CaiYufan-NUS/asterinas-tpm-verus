@@ -8,33 +8,33 @@ verus! {
 
 pub const TPM_HEADER_LEN: usize = 10;
 
-/// 无会话响应标签。
-pub const ST_NO_SESSIONS: u16 = 0x8001;
-/// 带会话（授权区）响应标签。
+/// Response tag without sessions.
+pub(crate) const ST_NO_SESSIONS: u16 = 0x8001;
+/// Response tag with sessions (authorization area).
 pub const ST_SESSIONS: u16 = 0x8002;
 
-/// 成功返回码。
+/// Success return code.
 pub const RC_SUCCESS: u32 = 0x0000;
 
-// ===================== 解析错误 =====================
+// ===================== Parse errors =====================
 
 #[derive(PartialEq, Eq, Structural)]
 pub enum ParseError {
-    /// 字节数不足以取出下一个字段。
+    /// Not enough bytes to take the next field.
     Truncated,
-    /// 长度字段与实际字节数不符，或字段取值超出规范允许范围。
+    /// The length field does not match the actual byte count, or a field value is outside the range the specification allows.
     Malformed,
-    /// 计数超出本实现的静态容量上限。
+    /// A count exceeds this implementation's static capacity limit.
     Capacity,
-    /// 语法合法但本实现不支持（未知算法、未预期的响应形态）。
+    /// Syntactically valid but unsupported by this implementation (unknown algorithm, unexpected response shape).
     Unsupported,
-    /// TPM 报告了非零返回码。
+    /// The TPM reported a non-zero return code.
     TpmError(u32),
 }
 
-// ===================== 头部规约 =====================
+// ===================== Header spec =====================
 
-/// 报文头的抽象视图。`code` 在请求方向是命令码，在响应方向是返回码。
+/// Abstract view of the message header. `code` is the command code in the request direction and the return code in the response direction.
 pub struct HeaderView {
     pub tag: u16,
     pub size: u32,
@@ -48,18 +48,18 @@ pub open spec fn spec_header(s: Seq<u8>) -> HeaderView
     HeaderView { tag: spec_be16_at(s, 0), size: spec_be32_at(s, 2), code: spec_be32_at(s, 6) }
 }
 
-/// 一条响应"格式良好"：装得下头部，且长度字段与实到字节数逐字节一致。
+/// A response is "well-formed": it holds a header, and the length field matches the received byte count exactly.
 ///
-/// 这是整个解码层的锚点性质。传输层交上来的切片若不满足它，解析根本
-/// 不会启动，因此后续所有偏移推理都可以放心地以 `s.len()` 为界。
+/// This is the anchor property of the whole decoding layer. If a slice handed up by the transport layer does not satisfy it, parsing
+/// never starts, so all later offset reasoning can safely be bounded by `s.len()`.
 pub open spec fn spec_rsp_wf(s: Seq<u8>) -> bool {
     &&& s.len() >= TPM_HEADER_LEN
     &&& spec_header(s).size as nat == s.len()
 }
 
-// ===================== 响应视图 =====================
+// ===================== Response view =====================
 
-/// 已校验的响应：头部三字段 + 去掉头部的载荷。
+/// A validated response: the three header fields + the payload with the header removed.
 pub struct Response<'a> {
     pub tag: u16,
     pub rc: u32,
@@ -83,12 +83,12 @@ impl<'a> Response<'a> {
     }
 }
 
-/// 校验并拆解一条响应。
+/// Validate and take apart a response.
 ///
-/// 拒绝三类输入：长度不足一个头部、`size` 字段与实到字节数不符、
-/// 标签不是两个合法响应标签之一。返回码非零时不再往下解析载荷——
-/// 失败响应的载荷内容按规范是未定义的。
-pub fn parse_response(raw: &[u8]) -> (r: Result<Response<'_>, ParseError>)
+/// Rejects three kinds of input: length shorter than a header, a `size` field that does not match the received byte count, and
+/// a tag that is not one of the two legal response tags. When the return code is non-zero, the payload is not parsed further --
+/// the payload content of a failed response is undefined by the specification.
+pub(crate) fn parse_response(raw: &[u8]) -> (r: Result<Response<'_>, ParseError>)
     ensures
         r matches Ok(rsp) ==> {
             &&& rsp.wf(raw@)
@@ -102,21 +102,12 @@ pub fn parse_response(raw: &[u8]) -> (r: Result<Response<'_>, ParseError>)
 
     let mut c = Cursor::new();
 
-    let tag = match c.read_be16(raw) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
-    let size = match c.read_be32(raw) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
-    let rc = match c.read_be32(raw) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    let tag = c.read_be16(raw).ok_or(ParseError::Truncated)?;
+    let size = c.read_be32(raw).ok_or(ParseError::Truncated)?;
+    let rc = c.read_be32(raw).ok_or(ParseError::Truncated)?;
 
-    // 长度字段必须精确等于实到字节数：多一字节意味着上层截断有误，
-    // 少一字节意味着后续解析会读到不属于本条响应的数据。
+    // The length field must equal the received byte count exactly: one extra byte means the upper layer truncated wrongly,
+    // one byte short means later parsing would read data that does not belong to this response.
     if size as usize != raw.len() {
         return Err(ParseError::Malformed);
     }
@@ -127,17 +118,17 @@ pub fn parse_response(raw: &[u8]) -> (r: Result<Response<'_>, ParseError>)
         return Err(ParseError::TpmError(rc));
     }
 
-    let body = slice_subrange(raw, TPM_HEADER_LEN, raw.len());
+    let body = &raw[TPM_HEADER_LEN..raw.len()];
     Ok(Response { tag, rc, body })
 }
 
-// ===================== 请求头 =====================
+// ===================== Request header =====================
 
-/// 请求头的字节形态。命令载荷由 `cmd` 模块构造，两者拼接即整条请求。
+/// Byte form of the request header. The command payload is built by the `cmd` module; concatenating the two gives the whole request.
 ///
-/// `size` 需要在载荷长度确定后回填，因此这里只提供"给定总长度生成
-/// 头部"的纯函数，由缓冲区层在收尾时调用。
-pub fn build_header(tag: u16, code: u32, total_size: u32) -> (r: [u8; 10])
+/// `size` has to be filled in once the payload length is known, so only a pure function "generate the header
+/// given the total length" is provided here, called by the buffer layer at the end.
+pub(crate) fn build_header(tag: u16, code: u32, total_size: u32) -> (r: [u8; 10])
     ensures
         r@.len() == 10,
         spec_be16_at(r@, 0) == tag,

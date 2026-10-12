@@ -17,28 +17,29 @@ use crate::rewrite::{HEADER_SIZE, read_be32, write_be32};
 verus! {
 
 // ---------------------------------------------------------------------------
-// 返回码
+// Return codes
 // ---------------------------------------------------------------------------
 
 pub const RC_SUCCESS: u32 = 0x0000_0000;
 
-/// 位 7 置位表示「格式一」返回码：低 6 位是错误号，位 8..11 是出错的
-/// 句柄 / 参数 / 会话序号。分类时必须先把序号位抹掉。
+/// Bit 7 set means a "format one" return code: the low 6 bits are the error number, and bits 8..11 are the index of the offending
+/// handle / parameter / session. The index bits must be wiped before classifying.
 pub const RC_FMT1_BIT: u32 = 0x0000_0080;
+const RC_FMT1_MASK: u32 = 0x0000_00BF;
 
-pub const RC_HANDLE: u32 = 0x0000_008B;
-pub const RC_INTEGRITY: u32 = 0x0000_009F;
-pub const RC_CONTEXT_GAP: u32 = 0x0000_0901;
-pub const RC_OBJECT_MEMORY: u32 = 0x0000_0902;
-pub const RC_SESSION_MEMORY: u32 = 0x0000_0903;
-pub const RC_MEMORY: u32 = 0x0000_0904;
-pub const RC_REFERENCE_H0: u32 = 0x0000_0910;
+const RC_HANDLE: u32 = 0x0000_008B;
+const RC_INTEGRITY: u32 = 0x0000_009F;
+const RC_CONTEXT_GAP: u32 = 0x0000_0901;
+const RC_OBJECT_MEMORY: u32 = 0x0000_0902;
+const RC_SESSION_MEMORY: u32 = 0x0000_0903;
+const RC_MEMORY: u32 = 0x0000_0904;
+const RC_REFERENCE_H0: u32 = 0x0000_0910;
 pub const RC_YIELDED: u32 = 0x0000_0908;
 pub const RC_TESTING: u32 = 0x0000_090A;
 pub const RC_RETRY: u32 = 0x0000_0922;
 
-/// 抹掉格式一返回码里的 selector 位（`TPM_RC_P`/`TPM_RC_N_MASK` 等），
-/// 只保留真正的错误号，以便和 `RC_HANDLE` / `RC_REFERENCE_H0` 对齐。
+/// Wipe the selector bits in a format-one return code (`TPM_RC_P`/`TPM_RC_N_MASK`, etc.),
+/// keeping only the real error number, so that it lines up with `RC_HANDLE` / `RC_REFERENCE_H0`.
 pub open spec fn spec_rc_value(rc: u32) -> u32 {
     if rc & RC_FMT1_BIT == RC_FMT1_BIT {
         rc & 0xBFu32
@@ -47,24 +48,24 @@ pub open spec fn spec_rc_value(rc: u32) -> u32 {
     }
 }
 
-pub fn rc_value(rc: u32) -> (r: u32)
+fn rc_value(rc: u32) -> (r: u32)
     ensures
         r == spec_rc_value(rc),
 {
     if rc & RC_FMT1_BIT == RC_FMT1_BIT {
-        rc & 0xBFu32
+        rc & RC_FMT1_MASK
     } else {
         rc
     }
 }
 
-/// 返回码 → 编排层错误。
+/// Return code -> orchestration-layer error.
 ///
-/// 分类的语义边界只有一条要紧：什么算 [`IoErr::NotFound`]。它表示「目标
-/// 已不存在」，编排层据此把对应槽位直接遗忘而不是让整条路径失败——所以
-/// 这里只能放真正表示「引用了不存在的对象」的两个返回码，放宽会让状态
-/// 不一致被静默吞掉。
-pub fn classify_rc(rc: u32) -> (r: IoErr) {
+/// Only one semantic boundary of the classification matters: what counts as [`IoErr::NotFound`]. It means "the target
+/// no longer exists", and the orchestration layer uses it to simply forget the corresponding slot instead of failing the whole path -- so
+/// only the two return codes that truly mean "referenced a nonexistent object" may go here; widening it would let state
+/// inconsistencies be swallowed silently.
+fn classify_rc(rc: u32) -> (r: IoErr) {
     let v = rc_value(rc);
     if v == RC_HANDLE || v == RC_REFERENCE_H0 {
         IoErr::NotFound
@@ -81,29 +82,29 @@ pub fn classify_rc(rc: u32) -> (r: IoErr) {
 }
 
 // ---------------------------------------------------------------------------
-// 备份块布局
+// Backup block layout
 // ---------------------------------------------------------------------------
 
-/// 备份块的定长前缀：序号 8 字节、句柄 4 字节、层级 4 字节、数据长度 2 字节。
+/// Fixed-length prefix of a backup block: sequence number 8 bytes, handle 4 bytes, hierarchy 4 bytes, data length 2 bytes.
 pub const CTX_FIXED: usize = 18;
 
-/// 数据长度字段在备份块内的偏移。
+/// Offset of the data length field within the backup block.
 pub const CTX_SIZE_OFF: usize = 16;
 
-/// 备份缓冲区中从 `off` 开始的那一块占多少字节。
+/// How many bytes the block starting at `off` in the backup buffer occupies.
 pub open spec fn spec_ctx_len(s: Seq<u8>, off: int) -> int {
     CTX_FIXED + (s[off + CTX_SIZE_OFF] as int) * 256 + (s[off + CTX_SIZE_OFF + 1] as int)
 }
 
 // ---------------------------------------------------------------------------
-// 字节序两种写法的桥
+// A bridge between two ways of writing byte order
 // ---------------------------------------------------------------------------
 
-/// `endian` 用移位或、`cursor` 用乘加，两者是同一个函数的两种写法。
+/// `endian` uses shift-or and `cursor` uses multiply-add; the two are the same function written two ways.
 ///
-/// 报文头由 `build_header` 生成（规约用乘加形式），而句柄区由
-/// `rewrite::read_be32` 读取（规约用移位或形式），跨模块推理时必须先过
-/// 这条引理。**这是重复定义的代价**，合并规约之后它就可以删掉。
+/// The message header is produced by `build_header` (the spec uses the multiply-add form), while the handle area is read by
+/// `rewrite::read_be32` (the spec uses the shift-or form), so cross-module reasoning must go through
+/// this lemma first. **This is the price of the duplicated definition**; it can be deleted once the specs are merged.
 pub proof fn lemma_be32_forms_agree(s: Seq<u8>, off: int)
     requires
         0 <= off,
@@ -120,36 +121,36 @@ pub proof fn lemma_be32_forms_agree(s: Seq<u8>, off: int)
 }
 
 // ---------------------------------------------------------------------------
-// 芯片接触面（信任基）
+// Chip interface (trust base)
 // ---------------------------------------------------------------------------
 
-/// 一次完整的命令 / 响应往返。
+/// One complete command / response round trip.
 ///
-/// 这是本层与芯片之间唯一的接触点。实现方要么把假设直接摆在自己的
-/// `external_body` 里，要么像链路层那样把假设收进一个零大小的幽灵账本；
-/// 无论哪种，下面写下的后置条件都是本模块**据以推理的全部依据**。它们按命令
-/// 码分情况给出，而不是笼统地断言「句柄是新的」——这样每条假设都能指到具体
-/// 的规范条款上。
+/// This is the only point of contact between this layer and the chip. The implementer either puts the assumptions directly in their own
+/// `external_body`, or, as the link layer does, collects them into a zero-sized ghost ledger;
+/// either way, the postconditions written below are **the entire basis on which this module reasons**. They are given case by case on the command
+/// code, instead of broadly asserting "the handle is new" -- so each assumption can be pointed at a specific
+/// clause of the specification.
 ///
-/// TRUST 1：响应写入不越过 `rsp` 容量，且至少包含一个完整报文头。
-/// 依据：传输层按声明长度收字节，不足即报错。
+/// TRUST 1: the response is written within the capacity of `rsp` and contains at least one complete message header.
+/// Basis: the transport layer receives bytes according to the declared length and reports an error if they fall short.
 ///
-/// TRUST 2：ContextLoad 成功时返回的句柄不在 `live()` 中。
-/// 依据：句柄在被显式释放或换出之前唯一标识一个已装载对象，芯片不会把
-/// 一个仍然有效的句柄再次分配出去。**这是本模块单射性的最终来源**，
-/// 也是整个 TCB 里最实质的一条。
+/// TRUST 2: on a successful ContextLoad, the returned handle is not in `live()`.
+/// Basis: a handle uniquely identifies a loaded object until it is explicitly released or swapped out; the chip never hands out
+/// a still-valid handle a second time. **This is the ultimate source of this module's injectivity**,
+/// and the most substantive item in the whole TCB.
 ///
-/// TRUST 3：`live()` 只随 ContextLoad 成功而增长、随 FlushContext 而收缩，
-/// 其余命令不改变它。
+/// TRUST 3: `live()` grows only on a successful ContextLoad and shrinks on FlushContext;
+/// other commands do not change it.
 ///
-/// 关于释放命令的那条例外：它**不以传输成功为条件**。传输失败时本端无从得知
-/// 芯片是否已经释放，与其两边都不确定，不如统一按「本端不再追踪」处理——芯片
-/// 若确实没释放，那份资源会占到复位为止，这是已知且无从补救的泄漏。因此
-/// 「失败即无副作用」那条必须把释放命令排除在外，否则两条同时要求
-/// `live == old` 与 `live == old.remove(h)`，只有 `h` 本就不在集合里时才能
-/// 同时满足，实现方一个也做不出来。
+/// The exception for the release command: it is **not conditioned on transport success**. When the transport fails, this side cannot know
+/// whether the chip has released it; rather than being uncertain on both sides, it is uniformly treated as "this side no longer tracks it" -- if the chip
+/// did not actually release it, that resource stays occupied until reset, a known leak with no remedy. Therefore
+/// the "failure has no side effect" clause must exclude the release command, otherwise the two clauses would require
+/// both `live == old` and `live == old.remove(h)`, which can both hold only when `h` was not in the set to begin with,
+/// and no implementer could satisfy that.
 pub trait ChipTransport {
-    /// 芯片当前持有的句柄集合。纯幽灵状态，无运行时开销。
+    /// The set of handles the chip currently holds. Pure ghost state, no runtime overhead.
     spec fn live(&self) -> Set<u32>;
 
     fn exec(&mut self, cmd: &[u8], rsp: &mut [u8]) -> (r: Result<usize, IoErr>)
@@ -159,11 +160,11 @@ pub trait ChipTransport {
         ensures
             final(rsp).len() == old(rsp).len(),
             r.is_ok() ==> HEADER_SIZE <= r.unwrap() <= final(rsp).len(),
-            // 传输失败：无副作用。释放命令除外，见上面的说明。
+            // Transport failure: no side effect. The release command is the exception; see the note above.
             (r.is_err() && be32_at(cmd@, 6) != CC_FLUSH_CONTEXT) ==> final(self).live() == old(
                 self,
             ).live(),
-            // ContextLoad 成功且返回码为零
+            // ContextLoad succeeded with return code zero
             (r.is_ok() && be32_at(cmd@, 6) == CC_CONTEXT_LOAD && be32_at(final(rsp)@, 6)
                 == RC_SUCCESS) ==> {
                 &&& r.unwrap() >= HEADER_SIZE + 4
@@ -173,34 +174,34 @@ pub trait ChipTransport {
                     be32_at(final(rsp)@, HEADER_SIZE as int),
                 )
             },
-            // ContextLoad 未成功
+            // ContextLoad did not succeed
             (be32_at(cmd@, 6) == CC_CONTEXT_LOAD && (r.is_err() || be32_at(final(rsp)@, 6)
                 != RC_SUCCESS)) ==> final(self).live() == old(self).live(),
-            // FlushContext：无论传输层是否报错，该句柄都不再被追踪
+            // FlushContext: whether or not the transport layer reports an error, the handle is no longer tracked
             be32_at(cmd@, 6) == CC_FLUSH_CONTEXT ==> final(self).live() == old(self).live().remove(
                 be32_at(cmd@, HEADER_SIZE as int),
             ),
-            // 其余命令
+            // Other commands
             (be32_at(cmd@, 6) != CC_CONTEXT_LOAD && be32_at(cmd@, 6) != CC_FLUSH_CONTEXT)
                 ==> final(self).live() == old(self).live(),
     ;
 }
 
 // ---------------------------------------------------------------------------
-// 适配器
+// Adapter
 // ---------------------------------------------------------------------------
 
-/// 命令与响应暂存区的容量。上下文数据块可以接近一页，两个缓冲区
-/// 内联在结构体里共 8 KiB；若目标平台栈紧张，把它们换成调用方提供的
-/// 切片即可，本模块的证明不依赖它们的存储方式。
-pub const MSG_MAX: usize = 4096;
+/// Capacity of the command and response scratch areas. A context data block can approach a page, and the two buffers
+/// inlined in the struct total 8 KiB; if the target platform has a tight stack, replace them with
+/// caller-provided slices -- the proofs of this module do not depend on how they are stored.
+pub(crate) const MSG_MAX: usize = 4096;
 
-/// 把 [`ChipTransport`] 抬成编排层要的 [`ContextIo`]。
+/// Lift [`ChipTransport`] to the [`ContextIo`] the orchestration layer needs.
 ///
-/// 这一层是完全验证的：它做的全部事情是长度校验、报文组装、返回码分类。
-/// 幽灵集合直接透传给传输层，本层不引入任何新的假设——这一点要靠三个方法
-/// 都没有 `external_body` 来保证，一旦有一个被标上，上面那句话就不再成立，
-/// 而编排层的单射性正是建立在这句话之上。
+/// This layer is fully verified: everything it does is length checking, message assembly and return-code classification.
+/// The ghost set is passed straight through to the transport layer, and this layer introduces no new assumptions -- this is guaranteed by none of the three methods
+/// carrying `external_body`; if any one were marked, the sentence above would no longer hold,
+/// and the injectivity of the orchestration layer is built on exactly that sentence.
 pub struct CtxIo<T: ChipTransport> {
     tx: T,
     cbuf: [u8; MSG_MAX],
@@ -219,11 +220,11 @@ impl<T: ChipTransport> CtxIo<T> {
         self.tx.live()
     }
 
-    /// 把 10 字节报文头落到命令缓冲区开头。
+    /// Lay the 10-byte message header at the start of the command buffer.
     ///
-    /// 后置条件里那句「幽灵集合不变」不是形式主义：组装报文与芯片状态无关，
-    /// 把这一点写下来，后面每个方法才能把「进入函数时的集合」一路带到发送
-    /// 那一刻，而不必在中途重新为它找依据。
+    /// The postcondition "the ghost set is unchanged" is not formalism: assembling the message has nothing to do with the chip state,
+    /// and writing this down is what lets every later method carry "the set on entering the function" all the way to
+    /// the moment of sending, without having to find justification for it again midway.
     fn put_header(&mut self, code: u32, total: usize)
         requires
             total <= MSG_MAX,
@@ -233,17 +234,13 @@ impl<T: ChipTransport> CtxIo<T> {
             final(self).tx_live() == old(self).tx_live(),
     {
         let hdr = build_header(ST_NO_SESSIONS, code, total as u32);
-        let mut k: usize = 0;
-        while k < HEADER_SIZE
+        for k in 0..HEADER_SIZE
             invariant
-                k <= HEADER_SIZE,
                 self.cbuf@.len() == MSG_MAX,
                 self.tx_live() == old(self).tx_live(),
                 forall|j: int| #![trigger self.cbuf@[j]] 0 <= j < k ==> self.cbuf@[j] == hdr@[j],
-            decreases HEADER_SIZE - k,
         {
             self.cbuf[k] = hdr[k];
-            k += 1;
         }
         proof {
             lemma_be32_forms_agree(self.cbuf@, 6);
@@ -251,10 +248,10 @@ impl<T: ChipTransport> CtxIo<T> {
         }
     }
 
-    /// 把整条命令原样交给底层传输，不做报文组装。
+    /// Hand the whole command to the underlying transport as is, without message assembly.
     ///
-    /// 与 `ContextIo` 的三个方法共享同一个传输层账本，因此在 `exec_raw`
-    /// 与 `load`/`save`/`flush` 之间交替调用时，句柄记账是连续的。
+    /// It shares the same transport-layer ledger with the three `ContextIo` methods, so when calls alternate between `exec_raw`
+    /// and `load`/`save`/`flush`, handle bookkeeping stays continuous.
     pub fn exec_raw(&mut self, cmd: &[u8], rsp: &mut [u8]) -> (r: Result<usize, IoErr>)
         requires
             cmd.len() >= HEADER_SIZE + 4,
@@ -283,11 +280,11 @@ impl<T: ChipTransport> CtxIo<T> {
         self.tx.exec(cmd, rsp)
     }
 
-    /// 交回底层传输，结束上下文往返阶段。
+    /// Hand back the underlying transport, ending the context round-trip phase.
     ///
-    /// 取走 `self`，两块暂存区随之释放，幽灵集合原样落到返回值上。后置条件
-    /// 里那句相等是阶段移交的依据：适配器代管期间对芯片做过什么，交回去的
-    /// 传输层照单全收，不重算也不清零。
+    /// Takes `self`, the two scratch areas are released with it, and the ghost set lands on the return value unchanged. The equality in the postcondition
+    /// is the basis of the phase handoff: whatever this adapter did to the chip while in custody, the transport layer handed back
+    /// accepts as is, without recomputing or clearing.
     pub fn release(self) -> (r: T)
         ensures
             r.live() == self.tx_live(),
@@ -304,7 +301,7 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
     fn load(&mut self, blob: &[u8], off: usize) -> (r: Result<(u32, usize), IoErr>) {
         let ghost live0 = self.tx_live();
 
-        // ---- 长度校验：先定长前缀，再变长数据 ----
+        // ---- Length check: the fixed-length prefix first, then the variable-length data ----
         if off > blob.len() || blob.len() - off < CTX_FIXED {
             return Err(IoErr::Integrity);
         }
@@ -318,28 +315,24 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
             return Err(IoErr::NoSpace);
         }
 
-        // ---- 组装：头部 + 原样搬运备份块 ----
+        // ---- Assembly: header + the backup block carried over as is ----
         self.put_header(CC_CONTEXT_LOAD, HEADER_SIZE + used);
-        let mut k: usize = 0;
-        while k < used
+        for k in 0..used
             invariant
-                k <= used,
                 off + used <= blob.len(),
                 HEADER_SIZE + used <= MSG_MAX,
                 self.cbuf@.len() == MSG_MAX,
                 be32_at(self.cbuf@, 6) == CC_CONTEXT_LOAD,
                 self.tx_live() == live0,
-            decreases used - k,
         {
             self.cbuf[HEADER_SIZE + k] = blob[off + k];
-            k += 1;
         }
 
-        // ---- 往返 ----
+        // ---- Round trip ----
         //
-        // 命令码此刻必须仍是装载：接触面的后置条件按命令码分情况给出，命令码
-        // 对不上，那些条件一条也用不上。搬运循环写的是报文头之后的区域，头部
-        // 四个字节没被碰过，这一点由循环不变量一路带到这里。
+        // The command code must still be load at this point: the interface's postconditions are given case by case on the command code, and if the command
+        // code does not match, none of those conditions can be used. The copy loop writes the area after the message header, and the four
+        // header bytes were never touched; this is carried by the loop invariant all the way to here.
         proof {
             assert(be32_at(self.cbuf@, 6) == CC_CONTEXT_LOAD);
         }
@@ -369,7 +362,7 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
 
         self.put_header(CC_CONTEXT_SAVE, HEADER_SIZE + 4);
         write_be32_arr(&mut self.cbuf, HEADER_SIZE, h);
-        // 句柄写在报文头之后，头部四个字节不在写入区间内。
+        // The handle is written after the message header; the four header bytes are not within the written range.
         proof {
             assert(be32_at(self.cbuf@, 6) == CC_CONTEXT_SAVE);
         }
@@ -388,7 +381,7 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
             return Err(classify_rc(rc));
         }
 
-        // 响应体即备份块本身，原样落到备份缓冲区。
+        // The response body is the backup block itself, landing in the backup buffer as is.
         let body = n - HEADER_SIZE;
         if body < CTX_FIXED {
             return Err(IoErr::Protocol);
@@ -396,18 +389,14 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
         if off > out.len() || out.len() - off < body {
             return Err(IoErr::NoSpace);
         }
-        let mut k: usize = 0;
-        while k < body
+        for k in 0..body
             invariant
-                k <= body,
                 out.len() == out_len,
                 off + body <= out.len(),
                 HEADER_SIZE + body <= self.rbuf@.len(),
                 self.tx_live() == live0,
-            decreases body - k,
         {
             out[off + k] = self.rbuf[HEADER_SIZE + k];
-            k += 1;
         }
         assert(out.len() == out_len);
         Ok(body)
@@ -423,15 +412,15 @@ impl<T: ChipTransport> ContextIo for CtxIo<T> {
             assert(be32_at(self.cbuf@, HEADER_SIZE as int) == h);
         }
 
-        // 返回值刻意丢弃：释放失败无从补救，且调用点全在错误处理路径上。
-        // 幽灵集合的收缩不依赖这个返回值——接触面对释放命令的规约本就不以
-        // 传输成功为条件。
+        // The return value is deliberately dropped: a failed release has no remedy, and all call sites are on error-handling paths.
+        // The shrinking of the ghost set does not depend on this return value -- the interface's spec for the release command is
+        // not conditioned on transport success to begin with.
         let _ = self.tx.exec(&self.cbuf, &mut self.rbuf);
     }
 }
 
-/// [`write_be32`] 的定长数组版本。切片版要求 `&mut [u8]`，而这里操作的是
-/// 结构体里的数组字段，重借用会让 Verus 多出一层义务，直接写更省事。
+/// The fixed-length array version of [`write_be32`]. The slice version requires `&mut [u8]`, while what is operated on here is an array field
+/// of the struct, and reborrowing would add another layer of obligations for Verus; writing it directly is simpler.
 fn write_be32_arr(b: &mut [u8; MSG_MAX], off: usize, v: u32)
     requires
         off + 4 <= MSG_MAX,
@@ -488,7 +477,7 @@ mod tests {
             },
         });
 
-        let mut blob = [0u8; CTX_FIXED];
+        let blob = [0u8; CTX_FIXED];
         let err = io.load(&blob, 0);
         assert!(matches!(err, Err(IoErr::NotFound)));
     }

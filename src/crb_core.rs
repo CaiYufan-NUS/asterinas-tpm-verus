@@ -4,14 +4,14 @@ use crate::cursor::Cursor;
 use crate::msg::TPM_HEADER_LEN;
 
 // ===========================================================================
-// 驱动状态
+// Driver state
 // ===========================================================================
 
 pub struct Crb<P: CrbPhy> {
     pub phy: P,
-    /// 本驱动使用的 locality 号。
+    /// The locality number used by this driver.
     pub locality: u8,
-    /// 是否已申请到 locality 且尚未归还。
+    /// Whether a locality has been acquired and not yet relinquished.
     pub held: bool,
 }
 
@@ -27,10 +27,10 @@ impl<P: CrbPhy> Crb<P> {
     }
 
     // =======================================================================
-    // 通用轮询
+    // Generic polling
     // =======================================================================
 
-    /// 轮询一个控制区寄存器，直到 `(value & mask) == want`。
+    /// Poll a control-area register until `(value & mask) == want`.
     fn wait_reg32(&mut self, reg: u32, mask: u32, want: u32, budget: u32) -> Result<u32, CrbErr> {
         let mut left = budget;
         while left > 0 {
@@ -63,7 +63,7 @@ impl<P: CrbPhy> Crb<P> {
     }
 
     // =======================================================================
-    // 就绪 / 空闲
+    // Ready / idle
     // =======================================================================
 
     fn cmd_ready(&mut self, budget: u32) -> Result<(), CrbErr> {
@@ -79,7 +79,7 @@ impl<P: CrbPhy> Crb<P> {
     }
 
     // =======================================================================
-    // 发送
+    // Sending
     // =======================================================================
 
     pub fn send(&mut self, cmd: &[u8], len: usize) -> Result<(), CrbErr> {
@@ -88,10 +88,10 @@ impl<P: CrbPhy> Crb<P> {
         }
         check_cmd_bounds(cmd, len)?;
 
-        // 清取消位，避免本次命令被上一次残留取消请求影响。
+        // Clear the cancel bit so this command is not affected by a leftover cancel request from the previous one.
         self.phy.write32(REG_CTRL_CANCEL, CTRL_CANCEL_CLEAR)?;
 
-        // 设备上报的可用命令大小复核。
+        // Re-check the usable command size reported by the device.
         let adv = self.phy.read32(REG_CTRL_CMD_SIZE)?;
         if (len as u32) > adv {
             return Err(CrbErr::BadLength);
@@ -99,14 +99,14 @@ impl<P: CrbPhy> Crb<P> {
 
         self.phy.write_cmd(cmd, len)?;
 
-        // 确保缓冲写入先于 START 对设备可见。
+        // Ensure the buffer write is visible to the device before START.
         self.phy.fence();
 
         self.phy.write32(REG_CTRL_START, CTRL_START_INVOKE)
     }
 
     // =======================================================================
-    // 完成 / 接收
+    // Completion / receiving
     // =======================================================================
 
     fn wait_complete(&mut self, budget: u32) -> Result<(), CrbErr> {
@@ -139,7 +139,7 @@ impl<P: CrbPhy> Crb<P> {
 
         self.phy.read_rsp(TPM_HEADER_LEN, out, n - TPM_HEADER_LEN)?;
 
-        // 与原规约等价的运行时保护：响应长度字段应与返回长度一致。
+        // A runtime guard equivalent to the original spec: the response length field should match the returned length.
         let hdr_len = u32::from_be_bytes([out[2], out[3], out[4], out[5]]) as usize;
         if hdr_len != n {
             return Err(CrbErr::BadLength);
@@ -149,7 +149,7 @@ impl<P: CrbPhy> Crb<P> {
     }
 
     // =======================================================================
-    // 一次完整往返
+    // One complete round trip
     // =======================================================================
 
     pub fn transmit(&mut self, cmd: &[u8], len: usize, out: &mut [u8]) -> Result<usize, CrbErr> {
@@ -170,7 +170,7 @@ impl<P: CrbPhy> Crb<P> {
 
         let n = self.recv(out)?;
 
-        // 收尾失败不覆盖已得到的响应。
+        // A failure during cleanup does not overwrite a response already obtained.
         let _ = self.go_idle(budget_of(TIMEOUT_C_MS));
         Ok(n)
     }

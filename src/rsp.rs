@@ -6,32 +6,32 @@ use crate::msg::ParseError;
 
 verus! {
 
-// ===================== 静态容量 =====================
+// ===================== Static capacity =====================
 
-/// 同时可分配的 PCR bank 数上界。
+/// Upper bound on the number of PCR banks allocated at the same time.
 pub const MAX_PCR_BANKS: usize = 5;
 
-/// 可接受的 `sizeofSelect` 上界。PC Client 平台固定 24 个 PCR（3 字节），
-/// 这里留出余量，但绝不接受对端给出的任意长度。
-pub const PCR_SELECT_MAX: usize = 8;
+/// Upper bound on an acceptable `sizeofSelect`. The PC Client platform has a fixed 24 PCRs (3 bytes);
+/// some slack is left here, but an arbitrary length supplied by the peer is never accepted.
+const PCR_SELECT_MAX: usize = 8;
 
-/// 摘要长度上界（SHA-512）。
+/// Upper bound on digest length (SHA-512).
 pub const MAX_DIGEST_SIZE: usize = 64;
 
-// ===================== 算法标识（Part 2 §6.3） =====================
+// ===================== Algorithm identifiers (Part 2 §6.3) =====================
 
-pub const ALG_SHA1: u16 = 0x0004;
+const ALG_SHA1: u16 = 0x0004;
 pub const ALG_SHA256: u16 = 0x000B;
-pub const ALG_SHA384: u16 = 0x000C;
-pub const ALG_SHA512: u16 = 0x000D;
-pub const ALG_SM3_256: u16 = 0x0012;
+const ALG_SHA384: u16 = 0x000C;
+const ALG_SHA512: u16 = 0x000D;
+const ALG_SM3_256: u16 = 0x0012;
 
-/// 已知算法的摘要长度。
+/// Digest length of a known algorithm.
 ///
-/// 返回 `0` 表示"本实现不认识这个算法"——不是错误，只是长度需要另行
-/// 探测（读一次 PCR 0 即可）。把未知算法当成错误会让驱动在启用了新
-/// 摘要算法的设备上直接拒绝工作，代价过大。
-pub fn digest_size_of(alg_id: u16) -> (r: u16)
+/// Returning `0` means "this implementation does not recognize the algorithm" -- not an error, only that the length has to be probed
+/// separately (reading PCR 0 once is enough). Treating an unknown algorithm as an error would make the driver refuse to work on devices with a newly enabled
+/// digest algorithm, which costs too much.
+fn digest_size_of(alg_id: u16) -> (r: u16)
     ensures
         r as usize <= MAX_DIGEST_SIZE,
 {
@@ -50,11 +50,11 @@ pub fn digest_size_of(alg_id: u16) -> (r: u16)
     }
 }
 
-// ===================== 能力查询：单个属性 =====================
+// ===================== Capability query: a single property =====================
 
-/// 解析 `TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES)` 的返回值。
+/// Parse the return value of `TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES)`.
 ///
-/// 载荷布局（Part 3 §30.2）：
+/// Payload layout (Part 3 §30.2):
 ///
 /// ```text
 /// moreData      u8
@@ -63,42 +63,27 @@ pub fn digest_size_of(alg_id: u16) -> (r: u16)
 /// [property u32, value u32] * count
 /// ```
 ///
-/// 计数为零是合法响应（对端处于固件升级模式时会这样答），但调用方拿
-/// 不到值，所以按"无数据"报错而不是返回一个凭空捏造的零。
-pub fn parse_tpm_property(body: &[u8]) -> (r: Result<u32, ParseError>) {
+/// A zero count is a legal response (a peer in firmware-upgrade mode answers like this), but the caller gets
+/// no value, so it is reported as "no data" rather than returning a made-up zero.
+pub(crate) fn parse_tpm_property(body: &[u8]) -> (r: Result<u32, ParseError>) {
     let mut c = Cursor::new();
 
-    match c.read_u8(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
-    match c.read_be32(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
-    let count = match c.read_be32(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    c.read_u8(body).ok_or(ParseError::Truncated)?;
+    c.read_be32(body).ok_or(ParseError::Truncated)?;
+    let count = c.read_be32(body).ok_or(ParseError::Truncated)?;
     if count == 0 {
         return Err(ParseError::Unsupported);
     }
-    // 只取第一条；属性标识本身对调用方无用，跳过
-    match c.read_be32(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
-    match c.read_be32(body) {
-        Some(v) => Ok(v),
-        None => Err(ParseError::Truncated),
-    }
+    // Take only the first entry; the property identifier itself is useless to the caller, so skip it
+    c.read_be32(body).ok_or(ParseError::Truncated)?;
+    c.read_be32(body).ok_or(ParseError::Truncated)
 }
 
-// ===================== PCR 分配 =====================
+// ===================== PCR allocation =====================
 
-/// 已分配的 PCR bank 表。
+/// Table of allocated PCR banks.
 ///
-/// `digest_sizes[i] == 0` 表示该 bank 的算法本实现不认识，长度待探测。
+/// `digest_sizes[i] == 0` means this implementation does not recognize the bank's algorithm, and the length is yet to be probed.
 pub struct PcrBanks {
     pub algs: [u16; 5],
     pub digest_sizes: [u16; 5],
@@ -119,98 +104,76 @@ impl PcrBanks {
     }
 }
 
-/// 解析 `TPM2_GetCapability(TPM_CAP_PCRS)`，得出实际分配了哪些 bank。
+/// Parse `TPM2_GetCapability(TPM_CAP_PCRS)` to determine which banks are actually allocated.
 ///
-/// 载荷布局：
+/// Payload layout:
 ///
 /// ```text
 /// moreData   u8
 /// capability u32          == TPM_CAP_PCRS
-/// count      u32          候选 bank 数
+/// count      u32          number of candidate banks
 /// [hashAlg u16, sizeofSelect u8, pcrSelect u8[sizeofSelect]] * count
 /// ```
 ///
-/// 一个 bank 只有在选择位图存在非零位时才算已分配；位图全零表示该算法
-/// 只是被支持、并未启用。
+/// A bank counts as allocated only if its select bitmap has a non-zero bit; an all-zero bitmap means the algorithm
+/// is merely supported, not enabled.
 ///
-/// 三处上界是这个函数的全部安全论据：`count <= MAX_PCR_BANKS` 限住循环
-/// 轮数，`sizeofSelect <= PCR_SELECT_MAX` 限住每轮步长，游标的
-/// `read_bytes` 限住位图取值——三者都在使用之前完成检查。
+/// The three upper bounds are the whole safety argument of this function: `count <= MAX_PCR_BANKS` bounds the number of loop
+/// rounds, `sizeofSelect <= PCR_SELECT_MAX` bounds the step of each round, and the cursor's
+/// `read_bytes` bounds the bitmap read -- all three are checked before use.
 pub fn parse_pcr_allocation(body: &[u8]) -> (r: Result<PcrBanks, ParseError>)
     ensures
         r matches Ok(b) ==> b.wf(),
 {
     let mut c = Cursor::new();
 
-    match c.read_u8(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
-    match c.read_be32(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
-    let count = match c.read_be32(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    c.read_u8(body).ok_or(ParseError::Truncated)?;
+    c.read_be32(body).ok_or(ParseError::Truncated)?;
+    let count = c.read_be32(body).ok_or(ParseError::Truncated)?;
 
     if count > MAX_PCR_BANKS as u32 {
         return Err(ParseError::Capacity);
     }
 
     let mut banks = PcrBanks::empty();
-    let mut i: u32 = 0;
 
-    while i < count
+    for i in 0..count
         invariant
             count <= MAX_PCR_BANKS as u32,
-            i <= count,
             banks.count <= i,
             banks.wf(),
             c.wf(body@.len()),
-        decreases count - i,
     {
-        let alg_id = match c.read_be16(body) {
-            Some(v) => v,
-            None => return Err(ParseError::Truncated),
-        };
-        let sel_size = match c.read_u8(body) {
-            Some(v) => v,
-            None => return Err(ParseError::Truncated),
-        };
+        let alg_id = c.read_be16(body).ok_or(ParseError::Truncated)?;
+        let sel_size = c.read_u8(body).ok_or(ParseError::Truncated)?;
         if sel_size as usize > PCR_SELECT_MAX {
             return Err(ParseError::Malformed);
         }
-        let select = match c.read_bytes(body, sel_size as usize) {
-            Some(s) => s,
-            None => return Err(ParseError::Truncated),
-        };
+        let select = c.read_bytes(body, sel_size as usize).ok_or(ParseError::Truncated)?;
 
         if any_nonzero(select) {
-            // banks.count <= i < count <= MAX_PCR_BANKS，下标必然合法
+            // banks.count <= i < count <= MAX_PCR_BANKS, so the index is necessarily valid
             banks.algs[banks.count] = alg_id;
             banks.digest_sizes[banks.count] = digest_size_of(alg_id);
-            banks.count = banks.count + 1;
+            banks.count += 1;
         }
 
-        i = i + 1;
     }
 
     Ok(banks)
 }
 
-// ===================== PCR 读取 =====================
+// ===================== PCR read =====================
 
-/// 一次 PCR 读取的结果：算法标识 + 摘要字节。
+/// The result of one PCR read: algorithm identifier + digest bytes.
 pub struct PcrValue<'a> {
     pub alg_id: u16,
     pub digest: &'a [u8],
 }
 
-/// 解析 `TPM2_PCR_Read` 响应（Part 3 §22.4）。
+/// Parse a `TPM2_PCR_Read` response (Part 3 §22.4).
 ///
-/// 载荷布局：
+/// Payload layout:
 ///
 /// ```text
 /// pcrUpdateCounter u32
@@ -218,36 +181,24 @@ pub struct PcrValue<'a> {
 /// pcrValues        count u32, [size u16, buffer[size]] * count
 /// ```
 ///
-/// 只接受"一个选择、一个摘要"的形态——这正是命令侧构造的请求所对应的
-/// 响应。对端多答的部分不去猜测其含义，直接拒绝。
+/// Only the shape "one selection, one digest" is accepted -- this is exactly the response corresponding to the request built on the command side.
+/// Extra parts the peer sends are not guessed at; they are rejected outright.
 pub fn parse_pcr_read(body: &[u8]) -> (r: Result<PcrValue<'_>, ParseError>)
     ensures
         r matches Ok(v) ==> v.digest@.len() <= MAX_DIGEST_SIZE,
 {
     let mut c = Cursor::new();
 
-    // pcrUpdateCounter：本层不关心
-    match c.read_be32(body) {
-        Some(_) => {},
-        None => return Err(ParseError::Truncated),
-    }
+    // pcrUpdateCounter: not of interest at this layer
+    c.read_be32(body).ok_or(ParseError::Truncated)?;
 
-    let sel_count = match c.read_be32(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    let sel_count = c.read_be32(body).ok_or(ParseError::Truncated)?;
     if sel_count != 1 {
         return Err(ParseError::Unsupported);
     }
 
-    let alg_id = match c.read_be16(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
-    let sel_size = match c.read_u8(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    let alg_id = c.read_be16(body).ok_or(ParseError::Truncated)?;
+    let sel_size = c.read_u8(body).ok_or(ParseError::Truncated)?;
     if sel_size as usize > PCR_SELECT_MAX {
         return Err(ParseError::Malformed);
     }
@@ -255,55 +206,40 @@ pub fn parse_pcr_read(body: &[u8]) -> (r: Result<PcrValue<'_>, ParseError>)
         return Err(ParseError::Truncated);
     }
 
-    let digest_count = match c.read_be32(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    let digest_count = c.read_be32(body).ok_or(ParseError::Truncated)?;
     if digest_count != 1 {
         return Err(ParseError::Unsupported);
     }
 
-    let digest_size = match c.read_be16(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
+    let digest_size = c.read_be16(body).ok_or(ParseError::Truncated)?;
     if digest_size as usize > MAX_DIGEST_SIZE {
         return Err(ParseError::Malformed);
     }
 
-    let digest = match c.read_bytes(body, digest_size as usize) {
-        Some(s) => s,
-        None => return Err(ParseError::Truncated),
-    };
+    let digest = c.read_bytes(body, digest_size as usize).ok_or(ParseError::Truncated)?;
 
     Ok(PcrValue { alg_id, digest })
 }
 
-// ===================== 随机数 =====================
+// ===================== Random numbers =====================
 
-/// 解析 `TPM2_GetRandom` 响应（Part 3 §16.1）：一个 `TPM2B_DIGEST`。
+/// Parse a `TPM2_GetRandom` response (Part 3 §16.1): one `TPM2B_DIGEST`.
 ///
-/// 返回借用而非拷贝。要多少字节由调用方按 `max` 自行裁剪，本层只保证
-/// 返回的切片确实落在载荷内、且长度不超过对端声明的值。
+/// Returns a borrow rather than a copy. The caller trims to however many bytes it wants up to `max`; this layer only guarantees
+/// that the returned slice really lies within the payload and is no longer than the value the peer declared.
 pub fn parse_random(body: &[u8], max: u16) -> (r: Result<&[u8], ParseError>)
     ensures
         r matches Ok(s) ==> s@.len() <= max,
 {
     let mut c = Cursor::new();
 
-    let size = match c.read_be16(body) {
-        Some(v) => v,
-        None => return Err(ParseError::Truncated),
-    };
-    // 对端给多了同样是异常：说明它没有遵守请求里的上限
+    let size = c.read_be16(body).ok_or(ParseError::Truncated)?;
+    // The peer giving too much is likewise abnormal: it means it did not respect the upper limit in the request
     if size > max {
         return Err(ParseError::Malformed);
     }
 
-    match c.read_bytes(body, size as usize) {
-        Some(s) => Ok(s),
-        None => Err(ParseError::Truncated),
-    }
+    c.read_bytes(body, size as usize).ok_or(ParseError::Truncated)
 }
 
 } // verus!

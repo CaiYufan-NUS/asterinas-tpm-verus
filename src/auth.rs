@@ -11,29 +11,29 @@ verus! {
 broadcast use group_crypto_axioms;
 
 // ===========================================================================
-// 报文常量
+// Message constants
 // ===========================================================================
 
-/// 标签 2 字节 + 长度 4 字节 + 命令码或返回码 4 字节。
+/// Tag 2 bytes + length 4 bytes + command code or return code 4 bytes.
 pub const HEADER_LEN: usize = 10;
 
-/// 带授权区的报文标签。授权区只在这个标签下存在。
+/// Message tag with an authorization area. The authorization area exists only under this tag.
 pub const ST_SESSIONS: u16 = 0x8002;
 
-/// 会话属性位。
+/// Session attribute bits.
 pub const SA_CONTINUE_SESSION: u8 = 0x01;
 pub const SA_DECRYPT: u8 = 0x20;
 pub const SA_ENCRYPT: u8 = 0x40;
 
-/// 授权区里最多允许出现的会话数。
+/// Maximum number of sessions allowed in the authorization area.
 ///
-/// 规范上限是 3。本实现只追加自己那一个，但响应里可能夹带调用方另行附加
-/// 的会话，解析侧仍要能跳过它们——跳过的轮数必须有上界，否则一条精心
-/// 构造的响应就能把解析循环拖住。
+/// The specification limit is 3. This implementation appends only its own, but a response may carry sessions attached separately by the caller,
+/// and the parsing side must still be able to skip them -- the number of skip rounds must be bounded, otherwise a carefully
+/// crafted response could hold the parsing loop hostage.
 pub const MAX_SESSIONS: usize = 3;
 
 // ===========================================================================
-// 命令侧授权区布局
+// Command-side authorization area layout
 // ===========================================================================
 //
 // ```text
@@ -52,51 +52,51 @@ pub const SESS_ATTRS_OFF: usize = SESS_NONCE_OFF + NONCE_LEN;
 pub const SESS_HMAC_SIZE_OFF: usize = SESS_ATTRS_OFF + 1;
 pub const SESS_HMAC_OFF: usize = SESS_HMAC_SIZE_OFF + 2;
 
-/// 单个命令侧会话占用的字节数。
+/// Number of bytes occupied by a single command-side session.
 pub const CMD_SESSION_LEN: usize = SESS_HMAC_OFF + NONCE_LEN;
 
 // ===========================================================================
-// 错误
+// Errors
 // ===========================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Structural, Debug)]
 pub enum AuthErr {
-    /// 报文结构与其自身声明的长度对不上。
+    /// The message structure does not match the length it declares.
     Malformed,
-    /// 授权区里定位不到本会话。
+    /// This session cannot be located in the authorization area.
     NoSession,
-    /// nonce 或 HMAC 字段长度不是约定的摘要长度。这两个长度是对端可控的，
-    /// 放行任意值等于把后续所有偏移推理交给对端决定。
+    /// The nonce or HMAC field length is not the agreed digest length. Both lengths are controlled by the peer;
+    /// letting arbitrary values through would hand all later offset reasoning over to the peer.
     BadField,
-    /// 重算出的 HMAC 与收到的不符。
+    /// The recomputed HMAC does not match the received one.
     HmacMismatch,
 }
 
 // ===========================================================================
-// 哈希输入规约
+// Hash input specs
 // ===========================================================================
 //
-// 三条拼接规则，编码侧与校验侧共用同一份定义。所有关于「算出来的摘要是
-// 什么」的推理最终都归约到这里，两侧对字段顺序理解不一致的可能性因此被
-// 消除。
+// Three concatenation rules, shared by the encoding side and the verification side with a single definition. All reasoning about "what the computed digest
+// is" ultimately reduces to here, which removes any chance of the two sides
+// disagreeing on field order.
 
-/// 命令摘要的输入：命令码 ‖ 各句柄名字 ‖ 参数区。
-pub open spec fn spec_cp_input(ordinal: u32, names: Seq<u8>, parms: Seq<u8>) -> Seq<u8> {
-    be32_seq(ordinal) + names + parms
+/// Input of the command digest: command code ‖ handle names ‖ parameter area.
+pub open spec fn spec_cp_input(ordinal: u32, names: Seq<u8>, params: Seq<u8>) -> Seq<u8> {
+    be32_seq(ordinal) + names + params
 }
 
-/// 响应摘要的输入：返回码 ‖ 命令码 ‖ 参数区。
+/// Input of the response digest: return code ‖ command code ‖ parameter area.
 ///
-/// 返回码在这里恒为零——只有成功的响应才走到校验——但它仍要参与摘要。
-pub open spec fn spec_rp_input(rc: u32, ordinal: u32, parms: Seq<u8>) -> Seq<u8> {
-    be32_seq(rc) + be32_seq(ordinal) + parms
+/// The return code is always zero here -- only successful responses reach verification -- but it still takes part in the digest.
+pub open spec fn spec_rp_input(rc: u32, ordinal: u32, params: Seq<u8>) -> Seq<u8> {
+    be32_seq(rc) + be32_seq(ordinal) + params
 }
 
-/// 会话 HMAC 的输入：摘要 ‖ 较新的 nonce ‖ 较旧的 nonce ‖ 属性字节。
+/// Input of the session HMAC: digest ‖ newer nonce ‖ older nonce ‖ attribute byte.
 ///
-/// 两个 nonce 的先后是有方向的：命令方向本端 nonce 在前，响应方向对端
-/// nonce 在前。写反不会被任何长度检查发现，只表现为校验恒不通过，所以
-/// 顺序做成参数由调用点显式给出，而不是藏在函数体里。
+/// The order of the two nonces is directional: in the command direction the local nonce comes first, in the response direction the peer
+/// nonce comes first. Getting it backwards is caught by no length check and only shows up as verification never passing, so the
+/// order is made a parameter given explicitly at the call site rather than hidden in the function body.
 pub open spec fn spec_auth_input(
     digest: Seq<u8>,
     newer: Seq<u8>,
@@ -107,10 +107,10 @@ pub open spec fn spec_auth_input(
 }
 
 // ===========================================================================
-// 摘要与 HMAC 的可执行侧
+// Executable side of the digest and HMAC
 // ===========================================================================
 
-pub fn auth_hmac<H: HmacSha256Ctx>(
+pub(crate) fn auth_hmac<H: HmacSha256Ctx>(
     key: &[u8],
     digest: &[u8; SHA256_LEN],
     newer: &[u8; NONCE_LEN],
@@ -136,9 +136,9 @@ pub fn auth_hmac<H: HmacSha256Ctx>(
     h.finish()
 }
 
-pub fn rp_hash<S: Sha256Ctx>(rc: u32, ordinal: u32, parms: &[u8]) -> (r: [u8; SHA256_LEN])
+pub(crate) fn rp_hash<S: Sha256Ctx>(rc: u32, ordinal: u32, params: &[u8]) -> (r: [u8; SHA256_LEN])
     ensures
-        r@ =~= spec_sha256(spec_rp_input(rc, ordinal, parms@)),
+        r@ =~= spec_sha256(spec_rp_input(rc, ordinal, params@)),
 {
     let mut s = S::new();
     let rc_b = be32_arr(rc);
@@ -146,44 +146,44 @@ pub fn rp_hash<S: Sha256Ctx>(rc: u32, ordinal: u32, parms: &[u8]) -> (r: [u8; SH
 
     s.update(array_as_slice(&rc_b));
     s.update(array_as_slice(&ord_b));
-    s.update(parms);
+    s.update(params);
 
     proof {
-        assert(s.absorbed() =~= spec_rp_input(rc, ordinal, parms@));
+        assert(s.absorbed() =~= spec_rp_input(rc, ordinal, params@));
     }
 
     s.finish()
 }
 
-/// `names` 是各授权句柄名字的顺序拼接，由会话层准备。
-pub fn cp_hash<S: Sha256Ctx>(ordinal: u32, names: &[u8], parms: &[u8]) -> (r: [u8; SHA256_LEN])
+/// `names` is the in-order concatenation of the names of the authorized handles, prepared by the session layer.
+pub(crate) fn cp_hash<S: Sha256Ctx>(ordinal: u32, names: &[u8], params: &[u8]) -> (r: [u8; SHA256_LEN])
     ensures
-        r@ =~= spec_sha256(spec_cp_input(ordinal, names@, parms@)),
+        r@ =~= spec_sha256(spec_cp_input(ordinal, names@, params@)),
 {
     let mut s = S::new();
     let ord_b = be32_arr(ordinal);
 
     s.update(array_as_slice(&ord_b));
     s.update(names);
-    s.update(parms);
+    s.update(params);
 
     proof {
-        assert(s.absorbed() =~= spec_cp_input(ordinal, names@, parms@));
+        assert(s.absorbed() =~= spec_cp_input(ordinal, names@, params@));
     }
 
     s.finish()
 }
 
 // ===========================================================================
-// 命令侧：写出授权区
+// Command side: write the authorization area
 // ===========================================================================
 
-/// 在 `out[off..]` 处铺开一个会话，HMAC 字段先留空。
+/// Lay out one session at `out[off..]`, leaving the HMAC field empty for now.
 ///
-/// 留空而不是填随机字节：占位内容参与不了任何校验，但会被写进最终报文。
-/// 万一后续的 [`patch_hmac`] 因错误路径没跑到，留下的应当是一望而知的全
-/// 零，而不是看起来像真 MAC 的东西。
-pub fn write_cmd_session(
+/// Left empty rather than filled with random bytes: placeholder content cannot take part in any verification, but it will be written into the final message.
+/// If the later [`patch_hmac`] is not reached because of an error path, what remains should be obviously
+/// all zeros, not something that looks like a real MAC.
+pub(crate) fn write_cmd_session(
     out: &mut [u8],
     off: usize,
     handle: u32,
@@ -216,10 +216,8 @@ pub fn write_cmd_session(
     out[off + SESS_NONCE_SIZE_OFF] = n[0];
     out[off + SESS_NONCE_SIZE_OFF + 1] = n[1];
 
-    let mut i: usize = 0;
-    while i < NONCE_LEN
+    for i in 0..NONCE_LEN
         invariant
-            i <= NONCE_LEN,
             off + CMD_SESSION_LEN <= out.len(),
             out.len() == before.len(),
             spec_be32_at(out@, off + SESS_HANDLE_OFF) == handle,
@@ -229,20 +227,16 @@ pub fn write_cmd_session(
                 #![trigger out@[k]]
                 0 <= k < out.len() && (k < off || k >= off + CMD_SESSION_LEN) ==> out@[k]
                     == before[k],
-        decreases NONCE_LEN - i,
     {
         out[off + SESS_NONCE_OFF + i] = nonce[i];
-        i = i + 1;
     }
 
     out[off + SESS_ATTRS_OFF] = attrs;
     out[off + SESS_HMAC_SIZE_OFF] = n[0];
     out[off + SESS_HMAC_SIZE_OFF + 1] = n[1];
 
-    let mut j: usize = 0;
-    while j < NONCE_LEN
+    for j in 0..NONCE_LEN
         invariant
-            j <= NONCE_LEN,
             off + CMD_SESSION_LEN <= out.len(),
             out.len() == before.len(),
             spec_be32_at(out@, off + SESS_HANDLE_OFF) == handle,
@@ -254,15 +248,13 @@ pub fn write_cmd_session(
                 #![trigger out@[k]]
                 0 <= k < out.len() && (k < off || k >= off + CMD_SESSION_LEN) ==> out@[k]
                     == before[k],
-        decreases NONCE_LEN - j,
     {
         out[off + SESS_HMAC_OFF + j] = 0;
-        j = j + 1;
     }
 }
 
-/// 把算好的 MAC 填进占位处。
-pub fn patch_hmac(out: &mut [u8], off: usize, mac: &[u8; SHA256_LEN])
+/// Fill the computed MAC into the placeholder.
+pub(crate) fn patch_hmac(out: &mut [u8], off: usize, mac: &[u8; SHA256_LEN])
     requires
         off + CMD_SESSION_LEN <= old(out).len(),
     ensures
@@ -274,10 +266,8 @@ pub fn patch_hmac(out: &mut [u8], off: usize, mac: &[u8; SHA256_LEN])
                 ==> final(out)@[k] == old(out)@[k],
 {
     let ghost before = out@;
-    let mut i: usize = 0;
-    while i < SHA256_LEN
+    for i in 0..SHA256_LEN
         invariant
-            i <= SHA256_LEN,
             off + CMD_SESSION_LEN <= out.len(),
             out.len() == before.len(),
             forall|k: int| 0 <= k < i ==> out@[off + SESS_HMAC_OFF + k] == mac@[k],
@@ -285,49 +275,47 @@ pub fn patch_hmac(out: &mut [u8], off: usize, mac: &[u8; SHA256_LEN])
                 #![trigger out@[k]]
                 0 <= k < out.len() && (k < off + SESS_HMAC_OFF || k >= off + CMD_SESSION_LEN)
                     ==> out@[k] == before[k],
-        decreases SHA256_LEN - i,
     {
         out[off + SESS_HMAC_OFF + i] = mac[i];
-        i = i + 1;
     }
 }
 
 // ===========================================================================
-// 响应侧：定位授权区
+// Response side: locate the authorization area
 // ===========================================================================
 
-/// 一条响应里与本会话有关的位置信息。
+/// Location information in a response that concerns this session.
 ///
-/// 只记偏移不复制内容：参数区可能有几千字节，而校验只需要能指到它。
-/// nonce 例外——它要跨轮次留存，必须复制出来。
+/// Only offsets are recorded, content is not copied: the parameter area can be several thousand bytes, and verification only needs to be able to point at it.
+/// The nonce is an exception -- it must persist across rounds, so it has to be copied out.
 #[derive(Clone, Copy)]
 pub struct RspAuth {
-    /// 参数区起点。
-    pub parm_off: usize,
-    /// 参数区长度。
-    pub parm_len: usize,
-    /// 本会话 nonce 字段起点。
+    /// Start of the parameter area.
+    pub param_off: usize,
+    /// Length of the parameter area.
+    pub param_len: usize,
+    /// Start of this session's nonce field.
     pub nonce_off: usize,
-    /// 本会话 HMAC 字段起点。
+    /// Start of this session's HMAC field.
     pub hmac_off: usize,
-    /// 对端回报的会话属性。
+    /// Session attributes reported by the peer.
     pub attrs: u8,
-    /// 对端本轮的 nonce。
+    /// The peer's nonce for this round.
     pub tpm_nonce: [u8; NONCE_LEN],
 }
 
 impl RspAuth {
-    /// 定位结果自洽：各段互不重叠且都落在报文内，本会话的 HMAC 一直顶到
-    /// 报文末尾。
+    /// The location result is self-consistent: the segments do not overlap and all lie within the message, and this session's HMAC extends all the way to
+    /// the end of the message.
     pub open spec fn wf(self, raw: Seq<u8>) -> bool {
-        &&& HEADER_LEN <= self.parm_off
-        &&& self.parm_off + self.parm_len <= self.nonce_off
+        &&& HEADER_LEN <= self.param_off
+        &&& self.param_off + self.param_len <= self.nonce_off
         &&& self.nonce_off + NONCE_LEN + 3 == self.hmac_off
         &&& self.hmac_off + SHA256_LEN == raw.len()
     }
 
-    pub open spec fn parms(self, raw: Seq<u8>) -> Seq<u8> {
-        raw.subrange(self.parm_off as int, self.parm_off + self.parm_len)
+    pub open spec fn params(self, raw: Seq<u8>) -> Seq<u8> {
+        raw.subrange(self.param_off as int, self.param_off + self.param_len)
     }
 
     pub open spec fn mac(self, raw: Seq<u8>) -> Seq<u8> {
@@ -335,7 +323,7 @@ impl RspAuth {
     }
 }
 
-/// 取出偏移 `off` 起的一段 nonce。
+/// Take a nonce starting at offset `off`.
 fn read_nonce(raw: &[u8], off: usize) -> (r: [u8; NONCE_LEN])
     requires
         off + NONCE_LEN <= raw.len(),
@@ -343,36 +331,32 @@ fn read_nonce(raw: &[u8], off: usize) -> (r: [u8; NONCE_LEN])
         r@ =~= raw@.subrange(off as int, off + NONCE_LEN),
 {
     let mut out: [u8; NONCE_LEN] = [0u8; NONCE_LEN];
-    let mut i: usize = 0;
-    while i < NONCE_LEN
+    for i in 0..NONCE_LEN
         invariant
-            i <= NONCE_LEN,
             off + NONCE_LEN <= raw.len(),
             out@.len() == NONCE_LEN,
             forall|k: int| 0 <= k < i ==> out@[k] == raw@[off + k],
-        decreases NONCE_LEN - i,
     {
         out[i] = raw[off + i];
-        i = i + 1;
     }
     out
 }
 
-/// 在响应里定位第 `index` 个会话（从零计数）。
+/// Locate the `index`-th session (counting from zero) in the response.
 ///
-/// `rhandles` 是本条响应携带的句柄个数，取值只有零或一，来自命令属性表；
-/// 它不是从报文里读出来的，因为报文本身并不标注这一点。
+/// `rhandles` is the number of handles the response carries, which is only zero or one, taken from the command attribute table;
+/// it is not read from the message, because the message itself does not label it.
 ///
-/// 三处检查值得单独说明：
+/// Three checks deserve separate explanation:
 ///
-/// - **本会话必须是最后一个。** 若它后面还有别的会话，`hmac_off + 32` 就
-///   不等于报文长度。本实现追加会话时总是追加在最后，所以这条既是格式
-///   检查，也是「拿到的确实是自己那一个」的旁证。
-/// - **nonce 与 HMAC 长度必须恰为摘要长度。** 这两个长度由对端给出，一旦
-///   放行任意值，后面所有偏移就都由对端说了算。
-/// - **长度字段必须与实到字节数相等。** 少一字节意味着解析会读到不属于本
-///   条响应的数据，多一字节意味着上层截断有误。
-pub fn parse_rsp_auth(raw: &[u8], rhandles: usize, index: usize) -> (r: Result<RspAuth, AuthErr>)
+/// - **This session must be the last one.** If other sessions follow it, `hmac_off + 32` is
+///   not equal to the message length. This implementation always appends its session at the end, so this is both a format
+///   check and corroborating evidence that "what was obtained really is our own session".
+/// - **The nonce and HMAC lengths must be exactly the digest length.** Both lengths are given by the peer; once
+///   arbitrary values are let through, all later offsets are decided by the peer.
+/// - **The length field must equal the received byte count.** One byte short means parsing would read data that does not belong to this
+///   response, and one byte too many means the upper layer truncated wrongly.
+pub(crate) fn parse_rsp_auth(raw: &[u8], rhandles: usize, index: usize) -> (r: Result<RspAuth, AuthErr>)
     requires
         rhandles <= 1,
         index < MAX_SESSIONS,
@@ -388,16 +372,10 @@ pub fn parse_rsp_auth(raw: &[u8], rhandles: usize, index: usize) -> (r: Result<R
 
     let mut c = Cursor::new();
 
-    let tag = match c.read_be16(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
-    let size = match c.read_be32(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
-    // 返回码字段跳过：只有成功的响应会走到这里，校验用的返回码按规范以
-    // 零参与摘要，不必从报文里取。
+    let tag = c.read_be16(raw).ok_or(AuthErr::Malformed)?;
+    let size = c.read_be32(raw).ok_or(AuthErr::Malformed)?;
+    // Skip the return code field: only successful responses reach here, and the return code used for verification takes part in the digest as
+    // zero per the specification, so it need not be taken from the message.
     if !c.skip(raw, 4) {
         return Err(AuthErr::Malformed);
     }
@@ -413,53 +391,37 @@ pub fn parse_rsp_auth(raw: &[u8], rhandles: usize, index: usize) -> (r: Result<R
         return Err(AuthErr::Malformed);
     }
 
-    let parm_len_u32 = match c.read_be32(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
-    if parm_len_u32 as usize > raw.len() {
+    let param_len_u32 = c.read_be32(raw).ok_or(AuthErr::Malformed)?;
+    if param_len_u32 as usize > raw.len() {
         return Err(AuthErr::Malformed);
     }
-    let parm_len = parm_len_u32 as usize;
-    let parm_off = c.pos;
+    let param_len = param_len_u32 as usize;
+    let param_off = c.pos;
 
-    if !c.skip(raw, parm_len) {
+    if !c.skip(raw, param_len) {
         return Err(AuthErr::Malformed);
     }
 
-    // 跳过排在前面的会话。轮数由 `index` 封顶，循环必然终止。
-    let mut i: usize = 0;
-    while i < index
+    // Skip the sessions that come first. The number of rounds is capped by `index`, so the loop must terminate.
+    for i in 0..index
         invariant
-            i <= index,
             index < MAX_SESSIONS,
             c.wf(raw@.len()),
-        decreases index - i,
     {
-        let nl = match c.read_be16(raw) {
-            Some(v) => v,
-            None => return Err(AuthErr::Malformed),
-        };
+        let nl = c.read_be16(raw).ok_or(AuthErr::Malformed)?;
         if !c.skip(raw, nl as usize) {
             return Err(AuthErr::Malformed);
         }
         if !c.skip(raw, 1) {
             return Err(AuthErr::Malformed);
         }
-        let hl = match c.read_be16(raw) {
-            Some(v) => v,
-            None => return Err(AuthErr::Malformed),
-        };
+        let hl = c.read_be16(raw).ok_or(AuthErr::Malformed)?;
         if !c.skip(raw, hl as usize) {
             return Err(AuthErr::Malformed);
         }
-        i = i + 1;
     }
 
-    let nonce_len = match c.read_be16(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::NoSession),
-    };
+    let nonce_len = c.read_be16(raw).ok_or(AuthErr::NoSession)?;
     if nonce_len as usize != NONCE_LEN {
         return Err(AuthErr::BadField);
     }
@@ -470,40 +432,28 @@ pub fn parse_rsp_auth(raw: &[u8], rhandles: usize, index: usize) -> (r: Result<R
     }
     let tpm_nonce = read_nonce(raw, nonce_off);
 
-    let attrs = match c.read_u8(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
+    let attrs = c.read_u8(raw).ok_or(AuthErr::Malformed)?;
 
-    let hmac_len = match c.read_be16(raw) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
+    let hmac_len = c.read_be16(raw).ok_or(AuthErr::Malformed)?;
     if hmac_len as usize != SHA256_LEN {
         return Err(AuthErr::BadField);
     }
 
     let hmac_off = c.pos;
-    let hmac_end = match hmac_off.checked_add(SHA256_LEN) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
+    let hmac_end = hmac_off.checked_add(SHA256_LEN).ok_or(AuthErr::Malformed)?;
     if hmac_end != raw.len() {
         return Err(AuthErr::Malformed);
     }
-    let parm_end = match parm_off.checked_add(parm_len) {
-        Some(v) => v,
-        None => return Err(AuthErr::Malformed),
-    };
-    if parm_end > nonce_off {
+    let param_end = param_off.checked_add(param_len).ok_or(AuthErr::Malformed)?;
+    if param_end > nonce_off {
         return Err(AuthErr::Malformed);
     }
 
-    Ok(RspAuth { parm_off, parm_len, nonce_off, hmac_off, attrs, tpm_nonce })
+    Ok(RspAuth { param_off, param_len, nonce_off, hmac_off, attrs, tpm_nonce })
 }
 
 // ===========================================================================
-// 定时比较
+// Constant-time comparison
 // ===========================================================================
 
 proof fn lemma_or_xor_zero(acc: u8, x: u8, y: u8)
@@ -513,30 +463,26 @@ proof fn lemma_or_xor_zero(acc: u8, x: u8, y: u8)
     assert((acc | (x ^ y)) == 0 <==> (acc == 0 && x == y)) by (bit_vector);
 }
 
-/// 逐字节比较，不提前返回。
+/// Compare byte by byte, with no early return.
 ///
-/// 提前返回会让比较耗时随首个不同字节的位置变化，等于把「猜对了几个字节」
-/// 告诉能计时的一方。MAC 比较必须是定时的。
-pub fn ct_eq32(a: &[u8; SHA256_LEN], b: &[u8]) -> (r: bool)
+/// An early return makes the comparison time vary with the position of the first differing byte, which tells
+/// anyone who can measure time how many bytes were guessed right. MAC comparison must be constant-time.
+pub(crate) fn ct_eq32(a: &[u8; SHA256_LEN], b: &[u8]) -> (r: bool)
     requires
         b.len() == SHA256_LEN,
     ensures
         r == (a@ =~= b@),
 {
     let mut acc: u8 = 0;
-    let mut i: usize = 0;
-    while i < SHA256_LEN
+    for i in 0..SHA256_LEN
         invariant
-            i <= SHA256_LEN,
             b.len() == SHA256_LEN,
             (acc == 0) <==> (forall|k: int| 0 <= k < i ==> a@[k] == b@[k]),
-        decreases SHA256_LEN - i,
     {
         proof {
             lemma_or_xor_zero(acc, a@[i as int], b@[i as int]);
         }
-        acc = acc | (a[i] ^ b[i]);
-        i = i + 1;
+        acc |= a[i] ^ b[i];
     }
     acc == 0
 }

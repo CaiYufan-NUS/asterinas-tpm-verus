@@ -19,58 +19,58 @@ use crate::xfer::{RC_SUCCESS, Xfer, XferErr};
 verus! {
 
 // ===========================================================================
-// 本层要挡住的是什么
+// What this layer is meant to block
 // ===========================================================================
 //
-// 会话层已经能证明「MAC 对上了」，但那只是**提供**了一个校验函数。校验函数
-// 存在，不等于响应一定经过它——调用方完全可以发一条命令、拿到字节、直接解析，
-// 一路上没有任何东西提醒他漏了一步。会话层最有价值的那条性质因此停留在「可以
-// 成立」，而不是「必然成立」。
+// The session layer can already prove "the MAC matched", but that only **provides** a verification function. That the function
+// exists does not mean a response necessarily goes through it -- a caller can perfectly well send a command, get the bytes and parse them directly,
+// with nothing along the way reminding them that a step was skipped. The most valuable property of the session layer thus stays at "can hold"
+// rather than "must hold".
 //
-// 本层把它变成后者，靠的不是文档也不是断言，而是**可见性**：
+// This layer turns it into the latter, not with documentation or assertions but with **visibility**:
 //
-// - 响应缓冲区是本结构体的私有字段，模块之外拿不到它的引用；
-// - 读取响应参数的唯一函数要求出示一枚 [`Authenticated`]；
-// - [`Authenticated`] 含私有字段，本模块之外无法构造，而本模块只在 MAC 校验
-//   通过之后才铸造它。
+// - The response buffer is a private field of this struct; no reference to it can be obtained outside the module;
+// - The only function that reads response parameters requires an [`Authenticated`] to be presented;
+// - [`Authenticated`] contains a private field and cannot be constructed outside this module, while this module mints it only after the MAC
+//   verification has passed.
 //
-// 三条合起来，「未经校验的响应字节」在类型层面不可达。这不是一条需要证明的
-// 定理，是一条不需要证明的事实——它由 Rust 的可见性规则给出，验证器甚至不必
-// 参与。会绕过它的写法压根编译不过。
+// Taken together, "response bytes that have not been verified" are unreachable at the type level. This is not a
+// theorem that needs proving but a fact that needs no proof -- it follows from Rust's visibility rules, and the verifier does not even have to
+// take part. Any code that tries to bypass it simply does not compile.
 
 // ===========================================================================
-// 命令布局
+// Command layout
 // ===========================================================================
 
-/// 一条带授权的命令在缓冲区里的分区。
+/// The partitioning of an authorized command within the buffer.
 ///
-/// 由调用方给出而不是由本层推算：分区取决于具体命令有几个句柄、参数怎么排，
-/// 那是命令层的知识。本层只负责**核对这些分区互不冲突**，然后照着填。
+/// Supplied by the caller rather than derived by this layer: the partitioning depends on how many handles the specific command has and how its parameters are arranged,
+/// which is knowledge of the command layer. This layer is only responsible for **checking that the partitions do not conflict** and then filling them in.
 pub struct CmdLayout {
-    /// 命令总长度。必须与报文头里的长度字段一致，这一点由链路层复核。
+    /// Total command length. It must agree with the length field in the message header, which the link layer re-checks.
     pub len: usize,
-    /// 授权区起点。
+    /// Start of the authorization area.
     pub sess_off: usize,
-    /// 本会话在授权区里的序号。
+    /// This session's index in the authorization area.
     pub index: usize,
-    /// 参数区起点。
-    pub parm_off: usize,
-    /// 参数区长度。
-    pub parm_len: usize,
-    /// 响应里的句柄个数。摘要覆盖的是句柄之后的部分，数错一个，整段偏移全错。
+    /// Start of the parameter area.
+    pub param_off: usize,
+    /// Length of the parameter area.
+    pub param_len: usize,
+    /// Number of handles in the response. The digest covers the part after the handles; miscounting by one throws off every offset.
     pub rhandles: usize,
 }
 
 impl CmdLayout {
-    /// `cap` 是命令缓冲区容量。
+    /// `cap` is the capacity of the command buffer.
     ///
-    /// 「授权区整体位于参数区之前」这一条是报文格式本身规定的顺序，写进这里
-    /// 有一个额外的好处：它同时保证了填写授权区的动作不会碰到参数区，于是
-    /// 「摘要覆盖的参数就是调用方写下的参数」不需要另外论证。
+    /// "The authorization area lies entirely before the parameter area" is an ordering fixed by the message format itself; writing it down here
+    /// has an extra benefit: it also guarantees that filling in the authorization area never touches the parameter area, so
+    /// "the parameters covered by the digest are the ones the caller wrote" needs no separate argument.
     pub open spec fn wf(self, cap: int) -> bool {
         &&& TPM_HEADER_LEN <= self.sess_off
-        &&& self.sess_off + CMD_SESSION_LEN <= self.parm_off
-        &&& self.parm_off + self.parm_len <= self.len
+        &&& self.sess_off + CMD_SESSION_LEN <= self.param_off
+        &&& self.param_off + self.param_len <= self.len
         &&& TPM_HEADER_LEN <= self.len
         &&& self.len <= cap
         &&& self.index < MAX_SESSIONS
@@ -79,23 +79,23 @@ impl CmdLayout {
 }
 
 // ===========================================================================
-// 凭证
+// Credentials
 // ===========================================================================
 
-/// 一枚「这段响应的 MAC 已经对上」的凭证。
+/// A credential saying "the MAC of this response has matched".
 ///
-/// `seal` 是一个私有的零大小字段，作用只有一个：**本模块之外连构造这个类型
-/// 都做不到**——不是难做，是语言层面不允许，任何结构体字面量都会因为够不着
-/// 这个字段而被拒绝。凭证因此只能由 [`Guarded::invoke`] 在校验通过之后铸造，
-/// 于是持有一枚凭证这件事本身就是校验发生过的证据。
+/// `seal` is a private zero-sized field with a single purpose: **this type cannot even be constructed outside this module**
+/// -- not merely hard, but disallowed by the language; any struct literal is rejected because it cannot reach
+/// this field. A credential can therefore only be minted by [`Guarded::invoke`] after verification has passed,
+/// so holding one is itself evidence that verification took place.
 ///
-/// 定位结果 `a` 反而可以公开：读几个偏移不构成任何能力，能力在于凭证本身。
-/// 它也不怕被改——[`Guarded::parms`] 要求出示 [`Authenticated::certified`]，
-/// 而那条性质是就 `a` 说的，改一个偏移就再也证不出来。
+/// The location result `a`, on the other hand, can be public: reading a few offsets grants no capability; the capability lies in the credential itself.
+/// It is not at risk of being altered either -- [`Guarded::params`] requires presenting [`Authenticated::certified`],
+/// and that property is stated about `a`, so changing a single offset makes it unprovable.
 ///
-/// 其余字段是幽灵值，记下铸造时刻的密钥材料、命令码、本端 nonce 与属性。
-/// 它们不参与运行时计算，只是让 [`Authenticated::certified`] 能把那条 MAC
-/// 等式完整地写出来——凭证若说不清自己证的是什么，就退化成了一个标记。
+/// The remaining fields are ghost values recording the key material, command code, this side's nonce and attributes at minting time.
+/// They take no part in runtime computation; they only let [`Authenticated::certified`] state that MAC
+/// equation in full -- a credential that cannot say what it certifies degenerates into a mere marker.
 pub struct Authenticated {
     pub a: RspAuth,
     pub raw: Ghost<Seq<u8>>,
@@ -103,7 +103,7 @@ pub struct Authenticated {
     pub ordinal: Ghost<u32>,
     pub our_nonce: Ghost<Seq<u8>>,
     pub attrs: Ghost<u8>,
-    /// 封印。本模块之外无法赋值，因而无法构造本类型。
+    /// Seal. It cannot be assigned outside this module, so this type cannot be constructed.
     #[allow(dead_code)]
     seal: (),
 }
@@ -133,17 +133,17 @@ impl Authenticated {
         self.attrs@
     }
 
-    /// 凭证所断言的全部内容：报文分区自洽，且报文里那段 MAC 等于用记下的
-    /// 密钥材料、两枚 nonce、命令码重算出来的值。
+    /// Everything the credential asserts: the message partitioning is self-consistent, and the MAC segment in the message equals the value recomputed from the recorded
+    /// key material, both nonces and the command code.
     ///
-    /// 命令码来自本端记录而非报文——响应报文不携带命令码。这正是「把甲命令的
-    /// 响应挪给乙命令」在摘要层面就对不上的原因。
+    /// The command code comes from this side's record rather than the message -- the response message does not carry a command code. This is exactly why "moving command A's
+    /// response to command B" mismatches at the digest level.
     pub closed spec fn certified(self) -> bool {
         &&& self.view().wf(self.raw())
         &&& self.view().mac(self.raw()) =~= spec_hmac_sha256(
             self.key_material(),
             spec_auth_input(
-                spec_sha256(spec_rp_input(0, self.ordinal(), self.view().parms(self.raw()))),
+                spec_sha256(spec_rp_input(0, self.ordinal(), self.view().params(self.raw()))),
                 self.view().tpm_nonce@,
                 self.our_nonce(),
                 self.attrs(),
@@ -153,30 +153,30 @@ impl Authenticated {
 }
 
 // ===========================================================================
-// 错误
+// Errors
 // ===========================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Structural, Debug)]
 pub enum SecErr {
-    /// 字节没能走完一个来回。
+    /// The bytes did not complete a round trip.
     Bus(XferErr),
-    /// 器件返回了非零返回码。这类响应不带授权区，无从校验。
+    /// The device returned a non-zero return code. Such a response has no authorization area and cannot be verified.
     Rc(u32),
-    /// 响应到了，但授权校验没过。
+    /// The response arrived, but authorization verification failed.
     Auth(AuthErr),
 }
 
 // ===========================================================================
-// 受保护的往返
+// Protected round trip
 // ===========================================================================
 
 pub struct Guarded<P: TisPhy> {
     pub x: Xfer<P>,
     pub sess: AuthSession,
-    /// 响应暂存区。**私有**——本层的全部保证都建立在模块之外拿不到它之上。
+    /// Response scratch buffer. **Private** -- all guarantees of this layer rest on it being unreachable outside the module.
     rbuf: [u8; MSG_MAX],
-    /// 暂存区里有效字节数。公开无妨：长度不是能力，而改动它只会让
-    /// [`Guarded::parms`] 的前置条件证不出来。
+    /// Number of valid bytes in the scratch buffer. Public is harmless: a length is not a capability, and altering it only makes
+    /// the precondition of [`Guarded::params`] unprovable.
     pub rlen: usize,
 }
 
@@ -215,11 +215,11 @@ impl<P: TisPhy> Guarded<P> {
         &&& self.rlen <= MSG_MAX
     }
 
-    /// 最近一次响应的有效字节。
+    /// Valid bytes of the most recent response.
     ///
-    /// 只在规约里出现。凭证记下了铸造时刻的这段序列，读取参数时要求两者相等，
-    /// 于是「拿旧凭证去读新响应」这种用法在前置条件那一步就被挡住了——不需要
-    /// 版本号，也不需要运行时检查。
+    /// Appears only in specs. The credential records this sequence at minting time, and reading parameters requires the two to be equal,
+    /// so using an old credential to read a new response is blocked at the precondition -- no
+    /// version number and no runtime check are needed.
     pub closed spec fn rsp_view(&self) -> Seq<u8> {
         self.rbuf@.subrange(0, self.rlen as int)
     }
@@ -235,17 +235,17 @@ impl<P: TisPhy> Guarded<P> {
     }
 
     // =======================================================================
-    // 唯一入口
+    // The only entry point
     // =======================================================================
 
-    /// 发一条带授权的命令，只有 MAC 对上才返回。
+    /// Send an authorized command; returns only if the MAC matches.
     ///
-    /// 调用方需要事先把报文头、句柄区、参数区写好，并按 `lay` 留出授权区。
-    /// 授权区由本函数填写——它含有本轮 nonce，而 nonce 要到换取那一刻才产生，
-    /// 调用方提前填不了。
+    /// The caller must first write the message header, handle area and parameter area, and leave room for the authorization area according to `lay`.
+    /// The authorization area is filled in by this function -- it contains this round's nonce, and the nonce is only produced at the moment of the exchange,
+    /// so the caller cannot fill it in beforehand.
     ///
-    /// 失败路径一律作废会话。会话失败之后拿同一把密钥重试，等于给对面多一次
-    /// 猜测机会；作废之后要重新握手，代价是一次往返，换来的是猜测机会不累积。
+    /// Every failure path invalidates the session. Retrying with the same key after a session failure would give the other side one more chance to
+    /// guess; after invalidation a fresh handshake is needed, which costs one round trip but keeps guess opportunities from accumulating.
     pub fn invoke<S: Sha256Ctx, H: HmacSha256Ctx, R: NonceSource>(
         &mut self,
         rng: &mut R,
@@ -266,8 +266,8 @@ impl<P: TisPhy> Guarded<P> {
             final(self).idle(),
             final(cmd).len() == old(cmd).len(),
             r matches Ok(t) ==> {
-                // ★ 凭证只可能在校验通过之后铸造，因此这一条等价于
-                //   「本函数返回 Ok 当且仅当响应经过了 MAC 校验」
+                // ★ A credential can only be minted after verification passes, so this is equivalent to
+                //   "this function returns Ok if and only if the response went through MAC verification"
                 &&& t.certified()
                 &&& t.raw() =~= final(self).rsp_view()
                 &&& t.key_material() =~= old(self).session_key_material()
@@ -277,37 +277,37 @@ impl<P: TisPhy> Guarded<P> {
     {
         let ghost key0 = self.sess.key_material();
 
-        // ---- 1. 换 nonce，锁定本轮命令码与属性 ----
+        // ---- 1. Swap the nonce, lock in this round's command code and attributes ----
         self.sess.begin(rng, ordinal, attrs);
         let ghost nonce0 = self.sess.our_nonce@;
         let ghost attrs0 = self.sess.attrs;
 
-        // ---- 2. 填授权区骨架：句柄、本轮 nonce、属性，MAC 字段留空 ----
+        // ---- 2. Fill in the authorization area skeleton: handle, this round's nonce, attributes; leave the MAC field empty ----
         let handle = self.sess.handle;
         let nonce = self.sess.our_nonce;
         let sattrs = self.sess.attrs;
         write_cmd_session(cmd, lay.sess_off, handle, &nonce, sattrs);
 
-        // ---- 3. 定型：算 MAC 填进去 ----
+        // ---- 3. Finalize: compute the MAC and fill it in ----
         //
-        // 必须在参数写完之后、发送之前，且中间不能再动报文一个字节。授权区
-        // 整体位于参数区之前，上一步的写入落不到参数区里——这一点由布局的
-        // 格式良好性给出，不必逐字节论证。
+        // Must happen after the parameters are written and before sending, with not a single byte of the message changed in between. The authorization area
+        // lies entirely before the parameter area, so the writes of the previous step cannot land in the parameter area -- this is given by the
+        // well-formedness of the layout and needs no byte-by-byte argument.
         self.sess.finalize::<S, H>(
             cmd,
             lay.sess_off,
             lay.index,
             names,
-            lay.parm_off,
-            lay.parm_len,
+            lay.param_off,
+            lay.param_len,
         );
 
-        // ---- 4. 往返 ----
+        // ---- 4. Round trip ----
         let n = match self.x.run(&*cmd, lay.len, &mut self.rbuf) {
             Ok((n, rc)) => {
                 if rc != RC_SUCCESS {
-                    // 非零返回码的响应不带授权区，没有可校验的东西。它也不该
-                    // 被当作「校验失败」——那两件事对调用方的意义完全不同。
+                    // A response with a non-zero return code has no authorization area and nothing to verify. It also should not
+                    // be treated as a "verification failure" -- the two mean entirely different things to the caller.
                     self.sess.close();
                     return Err(SecErr::Rc(rc));
                 }
@@ -320,11 +320,11 @@ impl<P: TisPhy> Guarded<P> {
         };
         self.rlen = n;
 
-        // ---- 5. 校验 ----
+        // ---- 5. Verification ----
         //
-        // 报文按自述长度截断后交给校验：授权区的自洽性判断以「MAC 一直顶到
-        // 报文末尾」为准，多带一个字节的暂存区尾巴就会让这条判断落空。
-        let raw = slice_subrange(array_as_slice(&self.rbuf), 0, n);
+        // The message is truncated to its self-declared length before being handed to verification: the self-consistency check of the authorization area is based on "the MAC extends all
+        // the way to the end of the message", and a scratch-buffer tail with even one extra byte would defeat that check.
+        let raw = &self.rbuf[0..n];
         let a = match self.sess.check_response::<S, H>(raw, lay.rhandles) {
             Ok(a) => a,
             Err(e) => return Err(SecErr::Auth(e)),
@@ -348,27 +348,27 @@ impl<P: TisPhy> Guarded<P> {
     }
 
     // =======================================================================
-    // 取用响应
+    // Using the response
     // =======================================================================
 
-    /// 取出响应的参数区。
+    /// Take out the parameter area of the response.
     ///
-    /// 这是响应字节离开本结构体的**唯一出口**。前置条件要出示一枚与当前
-    /// 暂存区内容匹配的凭证：没有凭证拿不到字节，凭证过期也拿不到。
-    pub fn parms<'a>(&'a self, t: &Authenticated) -> (r: &'a [u8])
+    /// This is the **only exit** through which response bytes leave this struct. The precondition requires presenting a credential matching the current
+    /// scratch-buffer content: without a credential the bytes cannot be obtained, and neither can they with an expired credential.
+    pub fn params<'a>(&'a self, t: &Authenticated) -> (r: &'a [u8])
         requires
             self.wf(),
             t.certified(),
             t.raw() =~= self.rsp_view(),
         ensures
-            r@ =~= t.view().parms(t.raw()),
+            r@ =~= t.view().params(t.raw()),
     {
-        let off = t.a.parm_off;
-        let len = t.a.parm_len;
+        let off = t.a.param_off;
+        let len = t.a.param_len;
 
         proof {
-            // 分区自洽给出参数区落在有效字节之内，于是在整块暂存区上取同一段
-            // 与在有效字节上取同一段是同一件事。
+            // Partition self-consistency puts the parameter area within the valid bytes, so taking the same segment from the whole scratch buffer
+            // is the same as taking it from the valid bytes.
             assert(off + len <= self.rlen);
             assert(self.rbuf@.subrange(off as int, off + len) =~= t.raw().subrange(
                 off as int,
@@ -376,23 +376,23 @@ impl<P: TisPhy> Guarded<P> {
             ));
         }
 
-        slice_subrange(array_as_slice(&self.rbuf), off, off + len)
+        &self.rbuf[off..off + len]
     }
 
-    /// 响应参数区的长度。凭证已经把它固定下来，读取前不必再解析一次报文。
-    pub fn parm_len(&self, t: &Authenticated) -> (r: usize)
+    /// The length of the response parameter area. The credential has already fixed it, so there is no need to parse the message again before reading.
+    pub fn param_len(&self, t: &Authenticated) -> (r: usize)
         ensures
-            r == t.view().parm_len,
+            r == t.view().param_len,
     {
-        t.a.parm_len
+        t.a.param_len
     }
 
-    /// 交回链路，结束授权阶段。
+    /// Hand the link back, ending the authorization phase.
     ///
-    /// 会话随 `self` 一起消失，这正是想要的：一个不再持有链路的会话，nonce
-    /// 链条已经断了，留着只会让「拿旧会话继续说话」在类型上看起来可行。
-    /// 响应暂存区一并释放，此前铸出的凭证也就再没有对应的报文可读——那些
-    /// 凭证的前置条件要求报文与铸造时刻逐字节相同，而报文已经不在了。
+    /// The session disappears together with `self`, which is intended: a session that no longer holds the link has a broken nonce
+    /// chain, and keeping it would only make "continuing to talk with an old session" look feasible at the type level.
+    /// The response scratch buffer is released with it, so credentials minted earlier have no message left to read -- their
+    /// preconditions require the message to be byte-for-byte the same as at minting time, and the message is gone.
     pub fn release(self) -> (r: Xfer<P>)
         ensures
             r == self.xfer(),

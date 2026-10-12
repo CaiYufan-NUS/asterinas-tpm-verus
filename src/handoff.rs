@@ -12,50 +12,50 @@ use crate::xfer::Xfer;
 verus! {
 
 // ===========================================================================
-// 本层职责
+// What this layer is responsible for
 // ===========================================================================
 //
-// 到这里为止，各层各自成立，但它们对同一件东西提出了互斥的要求：传输链路
-// 全驱动只有一份，而上下文往返（[`CtxIo`]）与授权往返（[`Guarded`]）都要
-// 独占它。这不是接口设计上的疏忽——同一时刻真的只能有一方在总线上说话。
+// Up to this point each layer holds on its own, but they make mutually exclusive demands on the same thing: there is only one transport link
+// in the whole driver, and both the context round trip ([`CtxIo`]) and the authorized round trip ([`Guarded`]) need
+// exclusive use of it. This is no oversight in interface design -- only one party can really talk on the bus at a time.
 //
-// 所有权把这条约束表达得刚好：链路在两个阶段之间**移交**而不是**共享**，
-// 拿不到它的一方连一条命令都发不出去。本层就是那几个移交动作，除此之外
-// 不做任何事。
+// Ownership expresses this constraint exactly: the link is **handed over** between the two phases rather than **shared**,
+// and a party that does not hold it cannot send even a single command. This layer is just those handoff actions and does
+// nothing else.
 //
 // ---------------------------------------------------------------------------
-// 真正要紧的是账本，不是链路
+// What really matters is the ledger, not the link
 // ---------------------------------------------------------------------------
 //
-// 链路是运行时对象，移交它无非是移动几个字节。幽灵账本 [`LiveSet`] 不同：
-// 它编译后不占空间，却承载着整条证明链里最实质的那条假设——「芯片刚报上来
-// 的句柄，此前不曾有效」。上层句柄表的单射性最终都归结到它。
+// The link is a runtime object, and handing it over is merely moving a few bytes. The ghost ledger [`LiveSet`] is different:
+// it takes no space once compiled, yet carries the most substantive assumption in the whole proof chain -- "a handle the chip has just reported
+// was not valid before". The injectivity of the upper-layer handle table ultimately reduces to it.
 //
-// 于是有一条铁律：**账本必须跨阶段一路传下去，绝不能在中途重建**。
+// Hence an iron rule: **the ledger must be passed along across phases and must never be rebuilt midway**.
 //
-// 重建的诱惑很直接：移交时把账本丢掉，下一阶段调一次 `LiveSet::new()`，
-// 代码短得多，编译也照过。但那一句 `new()` 声明的是「芯片此刻什么都没有
-// 装载」，而芯片并不会因为本端换了个持有者就把上下文吐出来。声明与事实
-// 一旦分家，后续每一次「这个句柄是新的」都可能是假话，而句柄表的单射性
-// 正建立在那句话之上——表里两个虚拟句柄映到同一个真实句柄，两个 space
-// 之间的隔离也就没了。
+// The temptation to rebuild is direct: drop the ledger at handoff and call `LiveSet::new()` in the next phase;
+// the code is much shorter and it compiles just the same. But that `new()` declares "the chip has nothing
+// loaded right now", and the chip does not spit out its contexts just because this side changed holder. Once declaration and fact
+// part ways, every later "this handle is new" may be a lie, and the injectivity of the handle table
+// is built on exactly that sentence -- two virtual handles in the table would map to the same real handle, and the isolation
+// between spaces would be gone.
 //
-// 所以本层的每个函数都把账本原样接过来、原样交出去，签名里写明前后相等。
-// [`attach`] 是全驱动**唯一**合法的账本起点，理由见它自己的说明。
+// So every function in this layer takes the ledger over as is and hands it out as is, with the signature stating that before and after are equal.
+// [`attach`] is the **only** legitimate starting point of the ledger in the whole driver; see its own note for the reason.
 
 // ===========================================================================
-// 起点
+// Starting point
 // ===========================================================================
 
-/// 把刚引导完的链路接成一条带账本的芯片链路。
+/// Connect a freshly booted link into a chip link carrying a ledger.
 ///
-/// 这是 `LiveSet::new()` 唯一合法的调用点，因为「芯片什么都没装载」这句话
-/// 只在这一刻为真：引导序列刚刚让器件走完启动，此前的上电时序清空了全部
-/// 瞬态存储。换个地方调用，这句话就成了没有依据的断言。
+/// This is the only legitimate call site of `LiveSet::new()`, because the statement "the chip has nothing loaded"
+/// is true only at this moment: the boot sequence has just let the device finish starting, and the earlier power-up sequence cleared all
+/// transient storage. Called anywhere else, that statement becomes an unfounded assertion.
 ///
-/// 相应地，一次引导只应接一次。同一个器件接第二次会凭空得到第二本空账本,
-/// 而器件上很可能还留着第一本记着的东西。这条纪律靠 [`Xfer`] 的所有权兜住：
-/// 链路只有一份，交出去就调不到了。
+/// Accordingly, attach only once per boot. Attaching a second time to the same device would conjure a second empty ledger out of thin air,
+/// while the device may well still hold what the first ledger recorded. This discipline is secured by the ownership of [`Xfer`]:
+/// there is only one link, and once handed out it can no longer be called.
 pub fn attach<P: TisPhy>(x: Xfer<P>) -> (r: ChipLink<P>)
     ensures
         r.x == x,
@@ -65,12 +65,12 @@ pub fn attach<P: TisPhy>(x: Xfer<P>) -> (r: ChipLink<P>)
 }
 
 // ===========================================================================
-// 无会话阶段
+// Session-less phase
 // ===========================================================================
 
-/// 进入上下文往返阶段。
+/// Enter the context round-trip phase.
 ///
-/// 账本随链路一起进到适配器内部，之后由适配器代为持有。
+/// The ledger enters the adapter together with the link, and is thereafter held by the adapter on the caller's behalf.
 pub fn open_ctx<P: TisPhy>(link: ChipLink<P>) -> (r: CtxIo<ChipLink<P>>)
     ensures
         r.outstanding() == link.ledger.view(),
@@ -78,16 +78,16 @@ pub fn open_ctx<P: TisPhy>(link: ChipLink<P>) -> (r: CtxIo<ChipLink<P>>)
     CtxIo::new(link)
 }
 
-/// 离开上下文往返阶段，取回链路与账本。
+/// Leave the context round-trip phase, taking back the link and the ledger.
 ///
-/// 后置条件里那句相等是本层的全部价值所在：交出去多少句柄，收回来的账本
-/// 就记着多少，一个不多一个不少。这里**不要求账本为空**——要求它为空等于
-/// 强迫调用方在每次阶段切换前把所有上下文都释放掉，而上下文的存在意义恰恰
-/// 是跨越这类边界存活。
+/// The equality in the postcondition is the whole value of this layer: however many handles were handed out, the ledger taken back
+/// records exactly that many, no more and no fewer. It is **not required that the ledger be empty** -- requiring that would be like
+/// forcing the caller to release all contexts before every phase switch, while the whole point of a context is
+/// to survive across such boundaries.
 ///
-/// 芯片上确实可能残留着本端已经不再追踪的句柄（释放命令没能送达总线时就会
-/// 这样）。那是一处已知且无从补救的泄漏，它的账在链路层就已经记清楚了，本层
-/// 不重复处理，更不会因为「看起来不干净」就把账本抹掉重来。
+/// The chip may indeed retain handles this side no longer tracks (this happens when a release command fails to reach the bus).
+/// That is a known leak with no remedy, its books were already settled in the link layer, and this layer
+/// does not handle it again, let alone wipe the ledger and start over because things "look unclean".
 pub fn close_ctx<P: TisPhy>(io: CtxIo<ChipLink<P>>) -> (r: ChipLink<P>)
     ensures
         r.ledger.view() == io.outstanding(),
@@ -96,19 +96,19 @@ pub fn close_ctx<P: TisPhy>(io: CtxIo<ChipLink<P>>) -> (r: ChipLink<P>)
 }
 
 // ===========================================================================
-// 授权阶段
+// Authorization phase
 // ===========================================================================
 
-/// 进入受保护的往返阶段。链路交给会话，账本停放在调用方手里。
+/// Enter the protected round-trip phase. The link goes to the session, and the ledger is parked in the caller's hands.
 ///
-/// 账本在这个阶段被搁置，不随链路一起走。这样做站得住脚，靠的是一条区间
-/// 事实：账本记的是瞬态对象句柄，而授权阶段新增的是会话句柄，两者分处句柄
-/// 空间里互不重叠的两段。授权阶段无论建立多少会话，都不可能产生一个与账上
-/// 某条记录重号的句柄，账本因此不会因为「这段时间没人记账」而失真。
+/// The ledger is set aside in this phase and does not travel with the link. This stands up thanks to an interval
+/// fact: the ledger records transient object handles, while the authorization phase adds session handles, and the two lie in non-overlapping
+/// segments of the handle space. However many sessions the authorization phase establishes, it cannot produce a handle that collides with
+/// any entry on the ledger, so the ledger does not become inaccurate because "nobody kept the books during this time".
 ///
-/// 这条事实是有前提的：**授权阶段不得发出装载类命令**。发了，新的瞬态句柄
-/// 就落在账本管辖的区间里，而当时没人记账。调用纪律只有这一条，代价是授权
-/// 阶段与上下文换入换出不能交错——需要交错时，先 [`to_plain`] 回来。
+/// This fact has a precondition: **no load-type command may be issued during the authorization phase**. If one is, the new transient handle
+/// falls into the interval the ledger governs, and nobody is keeping the books at that time. The calling discipline is just this one rule, at the cost that the authorization
+/// phase cannot be interleaved with context swap-in/out -- when interleaving is needed, come back through [`to_plain`] first.
 pub fn to_auth<P: TisPhy>(link: ChipLink<P>, sess: AuthSession) -> (r: (Guarded<P>, LiveSet))
     ensures
         r.0.xfer() == link.x,
@@ -120,12 +120,12 @@ pub fn to_auth<P: TisPhy>(link: ChipLink<P>, sess: AuthSession) -> (r: (Guarded<
     (Guarded::new(x, sess), ledger)
 }
 
-/// 离开受保护的往返阶段，把链路与停放的账本重新接回一起。
+/// Leave the protected round-trip phase, reuniting the link with the parked ledger.
 ///
-/// 参数里的账本必须是 [`to_auth`] 交出去的那一本。类型系统在这里帮不上忙——
-/// [`LiveSet`] 是零大小类型，两本账在运行时长得一模一样，调用方拿另一本来
-/// 换也编译得过。真正防住这件事的是所有权：全驱动只在 [`attach`] 处产生过
-/// 一本账，没有第二本可拿。
+/// The ledger in the argument must be the one [`to_auth`] handed out. The type system cannot help here --
+/// [`LiveSet`] is a zero-sized type, the two ledgers look identical at runtime, and a caller can swap in another one
+/// and it still compiles. What really prevents this is ownership: the whole driver creates a ledger only at [`attach`],
+/// so there is no second one to take.
 pub fn to_plain<P: TisPhy>(g: Guarded<P>, ledger: LiveSet) -> (r: ChipLink<P>)
     ensures
         r.x == g.xfer(),
@@ -135,24 +135,24 @@ pub fn to_plain<P: TisPhy>(g: Guarded<P>, ledger: LiveSet) -> (r: ChipLink<P>)
 }
 
 // ===========================================================================
-// 一轮完整的阶段流转
+// One complete cycle of phase transitions
 // ===========================================================================
 //
-// 把上面四个函数串起来，驱动的生命周期是这样一条线：
+// Chaining the four functions above, the driver's lifecycle is a line like this:
 //
 // ```text
 //   bring_up            -> Xfer
-//   attach              -> ChipLink            账本在此产生，全程仅此一次
-//     open_ctx          -> CtxIo               装载 / 保存 / 释放上下文
+//   attach              -> ChipLink            the ledger is created here, once and only once
+//     open_ctx          -> CtxIo               load / save / release contexts
 //     close_ctx         -> ChipLink
-//     to_auth           -> Guarded + LiveSet   带授权的业务命令
+//     to_auth           -> Guarded + LiveSet   authorized business commands
 //     to_plain          -> ChipLink
-//     ...                                      中间两对可以任意次交替
+//     ...                                      the middle two pairs may alternate any number of times
 // ```
 //
-// 中间那四步可以反复交替，账本沿着这条线一路传递，从不重建。线的两端各有
-// 一次不可重复的动作：起点是 [`attach`]，终点是丢弃——终点不需要函数，因为
-// 丢弃一个 `ChipLink` 本来就什么都不必做。芯片上残留的东西由下一次上电清理，
-// 那是唯一真正可靠的清理手段。
+// The middle four steps can alternate repeatedly, and the ledger is passed along this line and never rebuilt. Each end of the line has
+// one action that cannot be repeated: the start is [`attach`] and the end is dropping -- the end needs no function, because
+// dropping a `ChipLink` requires nothing to be done anyway. Whatever is left on the chip is cleaned up by the next power-up,
+// which is the only truly reliable means of cleanup.
 
 } // verus!

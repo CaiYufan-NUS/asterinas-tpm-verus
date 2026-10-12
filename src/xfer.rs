@@ -19,93 +19,93 @@ use crate::tis_core::Tis;
 verus! {
 
 // ===========================================================================
-// 本层职责
+// What this layer is responsible for
 // ===========================================================================
 //
-// 传输层只管把字节送出去、把字节收回来，它对报文内容一无所知；命令层只管
-// 拼装与解析报文，它对总线一无所知。两者之间还剩三件事没人做，本层做这三件：
+// The transport layer only sends bytes out and takes bytes back, knowing nothing of message content; the command layer only
+// assembles and parses messages, knowing nothing of the bus. Three things remain between them that nobody does, and this layer does the three:
 //
-// 1. **命令自述长度与实际缓冲区的一致性**。命令头里的长度字段是后续所有
-//    编解码的依据，必须在字节离开本机之前就卡住，而不是等对端报错。
-// 2. **返回码提取**。它落在响应头的固定偏移上，取值本身不需要解析报文体，
-//    因此放在这里比放进命令层更早、更便宜。
-// 3. **可重试返回码的重传**。器件在自检或资源紧张时会要求稍后再来，这类
-//    应答不是错误，也不该让上层每个调用点各自处理。
+// 1. **Consistency between the command's self-declared length and the actual buffer**. The length field in the command header is the basis of
+//    all later encoding and decoding, and must be pinned down before the bytes leave this machine, rather than waiting for the peer to report an error.
+// 2. **Return-code extraction**. It sits at a fixed offset in the response header, and its value needs no parsing of the message body,
+//    so doing it here is earlier and cheaper than putting it in the command layer.
+// 3. **Retransmission on retryable return codes**. During self-test or resource shortage the device asks to come back later; such
+//    replies are not errors and should not have every upper-layer call site handle them separately.
 //
-// 本层**不做**的事：不解析报文体、不做授权、不碰句柄。这三件都需要知道
-// 具体命令的语义，属于更上层。
+// What this layer **does not** do: it does not parse message bodies, does no authorization, and touches no handles. All three need to know
+// the semantics of specific commands and belong to higher layers.
 
 // ===========================================================================
-// 返回码
+// Return codes
 // ===========================================================================
 //
-// 取值出自 TPM 2.0 Part 2 的返回码表。这里只列本层需要**据以决策**的几个，
-// 其余返回码原样上交，由调用方判断。
+// The values come from the return-code table of TPM 2.0 Part 2. Only the few this layer needs to **base decisions on** are listed here;
+// the other return codes are passed up as they are for the caller to judge.
 
 pub const RC_SUCCESS: u32 = 0x0000_0000;
 
-/// 警告类返回码的基址。位 11 置位表示「不是失败，是暂时不能办」。
+/// Base of the warning-class return codes. Bit 11 set means "not a failure, just not possible for now".
 pub const RC_WARN_BASE: u32 = 0x0000_0900;
 
-/// 器件正在自检，被请求的功能尚未就绪。
+/// The device is running its self-test, and the requested function is not ready yet.
 pub const RC_TESTING: u32 = 0x0000_090A;
 
-/// 器件当前忙，请稍后重发同一条命令。
+/// The device is currently busy; resend the same command later.
 pub const RC_RETRY: u32 = 0x0000_0922;
 
-/// 器件主动让出，命令未执行。语义上与 [`RC_RETRY`] 同类，但它由器件的调度
-/// 策略触发而非资源短缺，重发一次通常就能过。
+/// The device yielded voluntarily and the command was not executed. Semantically the same kind as [`RC_RETRY`], but triggered by the device's scheduling
+/// policy rather than resource shortage; resending once usually succeeds.
 pub const RC_YIELDED: u32 = 0x0000_0908;
 
 // ===========================================================================
-// 重传策略
+// Retransmission policy
 // ===========================================================================
 //
-// 退避从一个很短的间隔起步，每轮翻倍，到上限为止。翻倍而不是定间隔，是为了
-// 让「器件刚好在下一毫秒就绪」和「器件要忙好几秒」两种情况都不吃亏：前者只
-// 多等一个最小间隔，后者的重发次数是对数级而不是线性级。
+// The backoff starts at a very short interval and doubles each round, up to a cap. Doubling rather than a fixed interval is so that
+// both "the device happens to be ready in the next millisecond" and "the device stays busy for several seconds" come out fine: the former
+// waits only one minimum interval extra, and for the latter the number of resends is logarithmic rather than linear.
 //
-// 次数上限与单次等待上限**都**要有：只限次数，遇上退避封顶后就成了固定间隔
-// 的长时间死磕；只限时长，则每次重发都要重新计算已耗时间，而时间域正是本项
-// 目刻意回避的东西（见轮询预算的说明）。两个上限一起给，总等待时间的界就是
-// 一个常数，不需要读时钟也能说清楚。
+// **Both** a cap on the count and a cap on the single wait are needed: limiting only the count turns into a long fixed-interval grind once the backoff hits its ceiling;
+// limiting only the duration would force every resend to recompute the elapsed time, and the time domain is exactly what this project
+// deliberately avoids (see the note on the polling budget). With both caps given, the bound on total waiting time is
+// a constant, which can be stated without reading a clock.
 
-/// 首次退避的时长（毫秒）。
-pub const RETRY_FIRST_MS: u32 = 20;
+/// Duration of the first backoff (ms).
+const RETRY_FIRST_MS: u32 = 20;
 
-/// 单次退避的时长上限（毫秒）。
-pub const RETRY_CAP_MS: u32 = 2000;
+/// Upper limit of a single backoff (ms).
+const RETRY_CAP_MS: u32 = 2000;
 
-/// 重传次数上限。取到这个数之后仍是可重试返回码，就把它原样交给调用方——
-/// 本层不把「等了很久还是忙」翻译成错误，那是调用方该拿的判断。
+/// Upper limit on the number of retransmissions. If the return code is still retryable after reaching this number, it is passed to the caller as is --
+/// this layer does not translate "waited long and still busy" into an error; that judgment belongs to the caller.
 pub const RETRY_MAX: u32 = 8;
 
 // ===========================================================================
-// 命令时长表
+// Command duration table
 // ===========================================================================
 //
-// 不同命令的执行时长相差三个数量级：读一个 PCR 是微秒级，生成一对密钥可以
-// 到几十秒。用同一个等待预算去等两者，要么慢命令被误判超时，要么快命令的
-// 故障要等到很久以后才暴露。
+// Execution times of different commands differ by three orders of magnitude: reading a PCR takes microseconds, generating a key pair can take
+// tens of seconds. Waiting for both with the same budget means either slow commands are wrongly judged timed out, or a fast command's
+// fault is exposed only much later.
 //
-// 表里的数字是**上界**，不是期望值，取值宁大勿小：估小了会把正常执行判成
-// 超时，那是功能故障；估大了只是故障时多等一会儿。未列出的命令一律取保守
-// 默认值。
+// The numbers in the table are **upper bounds**, not expected values, and should err on the large side: underestimating judges normal execution as
+// a timeout, which is a functional fault; overestimating only means waiting a little longer on a fault. Commands not listed all take a conservative
+// default.
 
-pub const DURATION_SHORT_MS: u32 = 750;
+const DURATION_SHORT_MS: u32 = 750;
 
-pub const DURATION_MEDIUM_MS: u32 = 2000;
+const DURATION_MEDIUM_MS: u32 = 2000;
 
-pub const DURATION_LONG_MS: u32 = 30000;
+const DURATION_LONG_MS: u32 = 30000;
 
-/// 未列出命令的默认上界。取得很大是有意的：一条本层不认识的命令，本层也就
-/// 没有依据说它该多快。
-pub const DURATION_DEFAULT_MS: u32 = 120000;
+/// Default upper bound for unlisted commands. It is deliberately very large: for a command this layer does not recognize, this layer has
+/// no basis to say how fast it should be.
+const DURATION_DEFAULT_MS: u32 = 120000;
 
-/// 命令码 → 执行时长上界（毫秒）。
+/// Command code -> upper bound of execution time (ms).
 ///
-/// 返回值恒为正，因此 [`budget_of`] 折算出的轮询预算恒不为零。
-pub fn duration_ms(cc: u32) -> (r: u32)
+/// The return value is always positive, so the polling budget converted by [`budget_of`] is never zero.
+fn duration_ms(cc: u32) -> (r: u32)
     ensures
         r >= 1,
 {
@@ -113,10 +113,10 @@ pub fn duration_ms(cc: u32) -> (r: u32)
         == CC_GET_CAPABILITY {
         DURATION_SHORT_MS
     } else if cc == CC_CONTEXT_LOAD || cc == CC_CONTEXT_SAVE || cc == CC_FLUSH_CONTEXT {
-        // 上下文换入换出要动器件内部存储，比纯寄存器读写慢一档。
+        // Context swap-in/out touches the device's internal storage and is one notch slower than plain register reads and writes.
         DURATION_SHORT_MS
     } else if cc == CC_GET_RANDOM {
-        // 熵池不足时器件会等待累积，时长不由命令本身决定。
+        // When the entropy pool is insufficient the device waits to accumulate, and the duration is not determined by the command itself.
         DURATION_MEDIUM_MS
     } else if cc == CC_SELF_TEST {
         DURATION_LONG_MS
@@ -125,7 +125,7 @@ pub fn duration_ms(cc: u32) -> (r: u32)
     }
 }
 
-/// 命令码 → 等待响应的轮询预算。
+/// Command code -> polling budget for waiting on the response.
 pub fn poll_budget(cc: u32) -> (r: u32)
     ensures
         r >= 1,
@@ -134,39 +134,39 @@ pub fn poll_budget(cc: u32) -> (r: u32)
 }
 
 // ===========================================================================
-// 错误
+// Errors
 // ===========================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Structural, Debug)]
 pub enum XferErr {
-    /// 传输层报错。字节没能完整走完一个来回。
+    /// Transport-layer error. The bytes did not complete a round trip.
     Bus(TisErr),
-    /// 命令自身不成立：长度字段与缓冲区对不上。命令一个字节都没有发出。
+    /// The command itself does not hold: the length field does not match the buffer. Not a single byte of the command was sent.
     BadCommand,
 }
 
 // ===========================================================================
-// 格式良好性
+// Well-formedness
 // ===========================================================================
 
-/// 一条可以发送的命令：长度字段等于调用方声称的长度，且这段字节确实在
-/// 缓冲区里。
+/// A sendable command: the length field equals the length the caller claims, and those bytes really are in the
+/// buffer.
 ///
-/// 两个条件缺一不可。只查前者，缓冲区可能根本没那么长；只查后者，发出去的
-/// 字节数与器件按长度字段预期收到的字节数会对不上，器件将一直等着后半截，
-/// 而本端已经在等响应了——双方各等各的，直到超时。
+/// Both conditions are indispensable. Checking only the former, the buffer may not be that long at all; checking only the latter, the number of
+/// bytes sent will not match the number the device expects to receive according to the length field, and the device will keep waiting for the second half
+/// while this side is already waiting for the response -- each waiting for something different, until a timeout.
 pub open spec fn spec_cmd_wf(cmd: Seq<u8>, len: int) -> bool {
     &&& TPM_HEADER_LEN <= len
     &&& len <= cmd.len()
     &&& spec_be32_at(cmd, 2) == len
 }
 
-/// 大端 u32 读取，同时给出两种规约写法下的值。
+/// Big-endian u32 read, giving the value under both spec formulations at once.
 ///
-/// 报文头由命令层生成（规约用乘加形式），句柄区由重写层读取（规约用移位或
-/// 形式），本层横跨两者，读一次就把两种形式都摆出来，免得每个调用点各自
-/// 引一遍桥引理。
-pub fn peek_be32(b: &[u8], off: usize) -> (r: u32)
+/// The message header is generated by the command layer (the spec uses multiply-add form), and the handle area is read by the rewrite layer (the spec uses shift-or
+/// form); this layer straddles the two, and reading once lays out both forms, so that every call site need not
+/// introduce the bridge lemma on its own.
+pub(crate) fn peek_be32(b: &[u8], off: usize) -> (r: u32)
     requires
         off + 4 <= b.len(),
     ensures
@@ -179,7 +179,7 @@ pub fn peek_be32(b: &[u8], off: usize) -> (r: u32)
     read_be32(b, off)
 }
 
-pub fn cmd_wf(cmd: &[u8], len: usize) -> (r: bool)
+fn cmd_wf(cmd: &[u8], len: usize) -> (r: bool)
     ensures
         r == spec_cmd_wf(cmd@, len as int),
 {
@@ -193,11 +193,11 @@ pub fn cmd_wf(cmd: &[u8], len: usize) -> (r: bool)
     d as usize == len
 }
 
-/// 响应体（报文头之后的部分）不短于 `min_body`。
+/// The response body (the part after the message header) is no shorter than `min_body`.
 ///
-/// 单独列出来是因为它是**解析前的最后一道闸**：解析函数一律以「体长足够」
-/// 为前置条件，闸没关上，越界读取就从解析函数的内部实现细节变成了调用方的
-/// 责任，而调用方通常忘了。
+/// Listed separately because it is **the last gate before parsing**: parsing functions all take "the body is long enough"
+/// as a precondition, and if the gate is not closed, out-of-bounds reads turn from an internal implementation detail of the parsing function into the caller's
+/// responsibility, which callers usually forget.
 pub fn body_at_least(n: usize, min_body: usize) -> (r: bool)
     requires
         n >= TPM_HEADER_LEN,
@@ -208,13 +208,13 @@ pub fn body_at_least(n: usize, min_body: usize) -> (r: bool)
 }
 
 // ===========================================================================
-// 编排器
+// Orchestrator
 // ===========================================================================
 
 pub struct Xfer<P: TisPhy> {
     pub tis: Tis<P>,
-    /// 剩余可用的重传次数上限。做成字段而不是常量，是为了让引导阶段（器件
-    /// 刚上电、自检未完）与稳态使用同一套代码而取不同的耐心。
+    /// Upper limit on remaining retransmissions. Made a field rather than a constant so that the boot phase (device
+    /// just powered up, self-test unfinished) and steady state can use the same code with different patience.
     pub retries: u32,
 }
 
@@ -223,7 +223,7 @@ impl<P: TisPhy> Xfer<P> {
         self.tis.wf()
     }
 
-    /// 可以开始下一条命令：locality 未被持有。
+    /// Ready to start the next command: the locality is not held.
     pub open spec fn idle(&self) -> bool {
         self.tis.quiescent()
     }
@@ -236,12 +236,12 @@ impl<P: TisPhy> Xfer<P> {
         Xfer { tis, retries: RETRY_MAX }
     }
 
-    /// 运行时自检：状态是否满足发起命令的前提。
+    /// Runtime self-check: whether the state meets the preconditions for issuing a command.
     ///
-    /// 存在的理由是接口边界——本层被一个不带前置条件的接口调用（那个接口的
-    /// 签名由更上层的验证需要决定，改不动），而本层的方法有前置条件。差额只
-    /// 能在运行时补上：查一次，不满足就直接报错，不让不满足前提的调用继续
-    /// 往下走。
+    /// It exists because of an interface boundary -- this layer is called through an interface without preconditions (the signature of that interface
+    /// is determined by the verification needs of a higher layer and cannot be changed), while this layer's methods have preconditions. The difference can
+    /// only be made up at runtime: check once, and report an error directly if not satisfied, so that a call that does not meet the preconditions
+    /// cannot continue.
     pub fn ready(&self) -> (r: bool)
         ensures
             r ==> self.wf() && self.idle(),
@@ -250,14 +250,14 @@ impl<P: TisPhy> Xfer<P> {
     }
 
     // =======================================================================
-    // 退避
+    // Backoff
     // =======================================================================
 
-    /// 等待 `ticks` 个轮询间隔。
+    /// Wait for `ticks` polling intervals.
     ///
-    /// 用轮询间隔的整数倍表示等待时长，而不是接一个睡眠接口：本层不引入
-    /// 时间概念，等待的实际长度由物理层的节流实现决定。这条循环的终止性
-    /// 因此直接来自计数器。
+    /// The wait is expressed as an integer multiple of the polling interval rather than by hooking up a sleep interface: this layer introduces no
+    /// notion of time, and the actual length of the wait is decided by the throttle implementation of the physical layer. The termination of this loop
+    /// therefore comes directly from the counter.
     fn backoff(&mut self, ticks: u32)
         requires
             old(self).wf(),
@@ -277,22 +277,25 @@ impl<P: TisPhy> Xfer<P> {
             decreases left,
         {
             self.tis.phy.delay();
-            left = left - 1;
+            left -= 1;
         }
     }
 
     // =======================================================================
-    // 单次尝试
+    // Single attempt
     // =======================================================================
 
-    /// 发一条命令，收一条响应，并取出返回码。
+    /// Send a command, receive a response, and extract the return code.
     ///
-    /// 返回码取自响应头的固定偏移，取值不依赖任何报文体解析——响应长度已由
-    /// 传输层保证不小于一个报文头，因此这次读取无条件成立。
-    fn attempt(&mut self, cmd: &[u8], len: usize, rsp: &mut [u8]) -> (r: Result<
-        (usize, u32),
-        XferErr,
-    >)
+    /// The return code is taken from a fixed offset in the response header, and its value does not depend on any parsing of the message body -- the response length is already
+    /// guaranteed by the transport layer to be no less than a message header, so this read holds unconditionally.
+    fn attempt(
+        &mut self,
+        cmd: &[u8],
+        len: usize,
+        rsp: &mut [u8],
+        exec_budget: u32,
+    ) -> (r: Result<(usize, u32), XferErr>)
         requires
             old(self).wf(),
             old(self).idle(),
@@ -311,7 +314,7 @@ impl<P: TisPhy> Xfer<P> {
                 &&& rc == be32_at(final(rsp)@, 6)
             },
     {
-        let n = match self.tis.transmit(cmd, len, rsp) {
+        let n = match self.tis.transmit(cmd, len, rsp, exec_budget) {
             Ok(v) => v,
             Err(e) => return Err(XferErr::Bus(e)),
         };
@@ -320,14 +323,14 @@ impl<P: TisPhy> Xfer<P> {
     }
 
     // =======================================================================
-    // 带重传的一次往返
+    // One round trip with retransmission
     // =======================================================================
 
-    /// 值得重发的返回码。
+    /// Return codes worth resending.
     ///
-    /// 自检命令遇到「正在自检」是个例外：这条命令问的**就是**自检状态，
-    /// 「还在测」是一个有效答案而非需要规避的应答。把它当作可重试会把一次
-    /// 状态查询变成一段阻塞等待，引导阶段尤其不该这样。
+    /// The self-test command is an exception for "self-test in progress": this command asks **precisely** about the self-test state,
+    /// and "still testing" is a valid answer rather than a reply to be avoided. Treating it as retryable would turn a
+    /// status query into a blocking wait, which the boot phase in particular should not suffer.
     pub fn retryable(rc: u32, cc: u32) -> (r: bool) {
         if rc == RC_RETRY || rc == RC_YIELDED {
             true
@@ -338,23 +341,23 @@ impl<P: TisPhy> Xfer<P> {
         }
     }
 
-    /// 发一条命令，必要时重发，返回响应长度与返回码。
+    /// Send a command, resend if necessary, and return the response length and return code.
     ///
-    /// 三条性质在签名里写死：
+    /// Three properties are written into the signature:
     ///
-    /// - **命令没通过自检就一个字节都不发**。格式不良的命令在这里被挡下，
-    ///   器件永远见不到它。
-    /// - **无论走哪条出口，locality 都不再被持有**。这一条由传输层逐次保证，
-    ///   重传只是把那个保证串起来——每次尝试都是一次完整的申请与归还，而不是
-    ///   握着 locality 循环。多等几毫秒换整段等待期间其他 locality 可用，这笔
-    ///   账是划算的。
-    /// - **返回码就是响应头里的那个值**。本层不改写、不吞掉、不翻译；重传次数
-    ///   耗尽之后仍是可重试返回码的，原样上交。
+    /// - **If the command does not pass the self-check, not a single byte is sent**. A badly formed command is stopped here,
+    ///   and the device never sees it.
+    /// - **Whichever exit is taken, the locality is no longer held**. This is guaranteed by the transport layer on each attempt,
+    ///   and retransmission merely chains that guarantee together -- each attempt is a complete acquire and release, not a loop
+    ///   holding the locality. Waiting a few extra milliseconds in exchange for other localities being usable during the whole
+    ///   wait is a good trade.
+    /// - **The return code is the value in the response header**. This layer does not rewrite, swallow or translate it; if the retransmission count
+    ///   is exhausted and the return code is still retryable, it is passed up as is.
     ///
-    /// 重发是安全的，因为命令缓冲区是只读的：本层拿到的是一个不可变切片，
-    /// 从头到尾没有任何一步会修改它，所以第二次发送的字节与第一次逐字节相同。
-    /// 若换成收发共用一个缓冲区，这一点就不再成立，重发前必须先恢复原文——
-    /// 那是一个容易漏掉且很难在事后察觉的错误，分开两个缓冲区从根上避免了它。
+    /// Resending is safe because the command buffer is read-only: this layer receives an immutable slice,
+    /// and no step from start to finish modifies it, so the bytes sent the second time are identical to the first, byte for byte.
+    /// If a single buffer were shared for sending and receiving, this would no longer hold, and the original text would have to be restored before resending --
+    /// an error that is easy to miss and hard to notice afterwards; separating the two buffers avoids it at the root.
     pub fn run(&mut self, cmd: &[u8], len: usize, rsp: &mut [u8]) -> (r: Result<
         (usize, u32),
         XferErr,
@@ -378,8 +381,9 @@ impl<P: TisPhy> Xfer<P> {
         if !cmd_wf(cmd, len) {
             return Err(XferErr::BadCommand);
         }
-        // 长度已过闸，命令码所在的四个字节必然在缓冲区内。
+        // The length has passed the gate, so the four bytes holding the command code are necessarily within the buffer.
         let cc = peek_be32(cmd, 6);
+        let exec_budget = poll_budget(cc);
 
         let cap = budget_of(RETRY_CAP_MS);
         let mut ticks = budget_of(RETRY_FIRST_MS);
@@ -394,7 +398,7 @@ impl<P: TisPhy> Xfer<P> {
                 spec_cmd_wf(cmd@, len as int),
             decreases left,
         {
-            match self.attempt(cmd, len, rsp) {
+            match self.attempt(cmd, len, rsp, exec_budget) {
                 Ok((n, rc)) => {
                     if !Self::retryable(rc, cc) {
                         return Ok((n, rc));
@@ -404,21 +408,21 @@ impl<P: TisPhy> Xfer<P> {
             }
 
             self.backoff(ticks);
-            // 翻倍前先看上限，避免在计数器上做会溢出的乘法。
+            // Check the cap before doubling, to avoid a multiplication on the counter that could overflow.
             if ticks < cap {
                 if ticks <= cap - ticks {
-                    ticks = ticks + ticks;
+                    ticks += ticks;
                 } else {
                     ticks = cap;
                 }
             }
-            left = left - 1;
+            left -= 1;
         }
 
-        // 次数用尽。最后再发一次，结果不再过滤——「等了这么久还是忙」是一个
-        // 需要让调用方看见的事实，把它藏成本层的超时错误，上层就再也分不清
-        // 器件是忙还是坏了。
-        self.attempt(cmd, len, rsp)
+        // Count exhausted. Send one last time, with the result no longer filtered -- "waited this long and still busy" is a fact
+        // that the caller must be able to see; hiding it as a timeout error of this layer would leave the upper layer unable to tell
+        // whether the device is busy or broken.
+        self.attempt(cmd, len, rsp, exec_budget)
     }
 }
 

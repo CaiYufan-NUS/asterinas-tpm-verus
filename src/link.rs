@@ -15,28 +15,28 @@ use crate::xfer::{Xfer, XferErr, peek_be32};
 verus! {
 
 // ===========================================================================
-// 这一层是做什么的
+// What this layer does
 // ===========================================================================
 //
-// 编排层要求的接触面是「一次往返，外加芯片持有哪些句柄」；传输链路给出的是
-// 「一次往返」。差的那半句——句柄集合——是**芯片内部的状态**，本端观察不到，
-// 只能假设。
+// The interface the orchestration layer requires is "one round trip, plus which handles the chip holds"; the transport link provides
+// "one round trip". The missing half -- the handle set -- is **internal chip state**, which this side cannot observe and
+// can only assume.
 //
-// 假设不可避免，但可以关得很小。本模块把它压缩成一个零大小的幽灵账本：它在
-// 运行时不存在，编译后不占一个字节，唯一的作用是承载那句说不出口的话——
-// 「芯片刚刚报上来的句柄，此前不曾有效」。除此之外的每一步（长度校验、命令
-// 码分派、错误映射）都是普通的可验证代码。
+// Assumptions are unavoidable, but they can be kept very small. This module compresses it into a zero-sized ghost ledger: it does not exist
+// at runtime and takes not a single byte once compiled; its only role is to carry the sentence that cannot be said aloud --
+// "a handle the chip has just reported was not valid before". Every other step (length checks, command
+// code dispatch, error mapping) is ordinary verifiable code.
 //
-// 于是信任基的增量就是下面三个函数的后置条件，不多不少。
+// The increment to the trust base is thus the postconditions of the three functions below, no more and no less.
 
 // ===========================================================================
-// 幽灵账本（信任基）
+// Ghost ledger (trust base)
 // ===========================================================================
 
-/// 芯片当前持有的句柄集合。
+/// The set of handles the chip currently holds.
 ///
-/// 只有幽灵字段，运行时是零大小类型。所有修改它的方法都不含可执行代码——
-/// 它们不是在「记录」什么，而是在**声明本端对芯片行为的假设**。
+/// It has only ghost fields and is a zero-sized type at runtime. None of the methods that modify it contain executable code --
+/// they do not "record" anything, they **declare this side's assumptions about chip behavior**.
 pub struct LiveSet {
     pub ghost s: Set<u32>,
 }
@@ -54,22 +54,22 @@ impl LiveSet {
         unimplemented!()
     }
 
-    /// 记下芯片新装载的句柄。
+    /// Record a handle newly loaded by the chip.
     ///
-    /// **信任条款（一）**：`valid_phandle(h)`。
-    /// 依据：规范规定装载类命令成功时返回的句柄落在瞬态对象区间内，零与
-    /// 保留值都不是合法返回。
+    /// **Trust clause (1)**: `valid_phandle(h)`.
+    /// Basis: the specification states that on success a load-type command returns a handle within the transient object interval; zero and
+    /// reserved values are not legal returns.
     ///
-    /// **信任条款（二）**：`!old(self).view().contains(h)`。
-    /// 依据：一个句柄在被显式释放或换出之前唯一标识一个已装载对象，芯片不会
-    /// 把仍然有效的句柄再次分配出去。
+    /// **Trust clause (2)**: `!old(self).view().contains(h)`.
+    /// Basis: a handle uniquely identifies a loaded object until it is explicitly released or swapped out; the chip does not
+    /// hand out a still-valid handle a second time.
     ///
-    /// 第二条是**整条证明链里最实质的一条假设**：上层句柄表的单射性、两个
-    /// 句柄空间之间的隔离性，最终都归结到它。它也是唯一一条无法靠本端的任何
-    /// 检查加固的假设——本端若能自行验证句柄是新的，就不需要假设了。
+    /// The second is **the most substantive assumption in the whole proof chain**: the injectivity of the upper-layer handle table and the isolation between the two
+    /// handle spaces ultimately reduce to it. It is also the only assumption that cannot be hardened by any
+    /// check on this side -- if this side could verify for itself that a handle is new, no assumption would be needed.
     ///
-    /// 调用纪律：只能用刚刚从装载类命令的成功响应里读出的句柄调用，且该响应
-    /// 必须已经通过长度校验。任何其他调用方式都会让上述两条从假设变成谎言。
+    /// Calling discipline: call it only with a handle just read from the successful response of a load-type command, and that response
+    /// must already have passed the length check. Any other way of calling it turns the two clauses above from assumptions into lies.
     #[verifier::external_body]
     pub fn observe_load(&mut self, _h: u32)
         ensures
@@ -79,17 +79,17 @@ impl LiveSet {
     {
     }
 
-    /// 记下句柄已不再由本端追踪。
+    /// Record that a handle is no longer tracked by this side.
     ///
-    /// **信任条款（三）**：集合按 `h` 收缩。
+    /// **Trust clause (3)**: the set shrinks by `h`.
     ///
-    /// 句柄取幽灵值而非运行时值：这一步在运行时什么都不做，取值只用于证明。
-    /// 这样即使命令缓冲区短到读不出句柄字段，账仍然记得下——而不必为了记账
-    /// 去给命令缓冲区补一条本不需要的长度前提。
+    /// The handle is a ghost value rather than a runtime value: this step does nothing at runtime, and the value is used only in proofs.
+    /// This way, even if the command buffer is too short to read the handle field, the books can still be kept -- without having to
+    /// add a length precondition to the command buffer that it does not otherwise need just for bookkeeping.
     ///
-    /// 注意这里**不假设芯片真的释放了**。释放命令若因总线故障没能送达，那份
-    /// 资源会一直占着芯片直到复位。这是已知且无从补救的泄漏，写在账上只会
-    /// 让本端永远背着一个再也用不上的句柄。
+    /// Note that this does **not assume the chip really released it**. If the release command failed to arrive because of a bus fault, that
+    /// resource stays occupied on the chip until reset. This is a known leak with no remedy, and writing it on the ledger would only
+    /// make this side carry forever a handle that can never be used again.
     #[verifier::external_body]
     pub fn observe_flush(&mut self, _h: Ghost<u32>)
         ensures
@@ -99,7 +99,7 @@ impl LiveSet {
 }
 
 // ===========================================================================
-// 链路
+// Link
 // ===========================================================================
 
 pub struct ChipLink<P: TisPhy> {
@@ -122,29 +122,29 @@ impl<P: TisPhy> ChipTransport for ChipLink<P> {
     }
 
     fn exec(&mut self, cmd: &[u8], rsp: &mut [u8]) -> (r: Result<usize, IoErr>) {
-        // 命令码取自报文头的固定偏移。这一读无条件成立：接口前置条件已经
-        // 保证缓冲区不短于一个报文头。
+        // The command code is taken from a fixed offset in the message header. This read holds unconditionally: the interface precondition already
+        // guarantees the buffer is no shorter than a message header.
         let cc = peek_be32(cmd, 6);
         let ghost fh = be32_at(cmd@, HEADER_SIZE as int);
 
-        // 释放命令的账**先记，且记在所有提前返回之前**。接触面对释放命令的
-        // 规约不以传输成功为条件：传输失败时本端无从得知芯片是否已经释放，
-        // 与其两边都不确定，不如统一按「本端不再追踪」处理。这条账要是落在
-        // 某个 `return` 后面，那条路径就会留下一个语义上早已放弃、本端却仍在
-        // 追踪的句柄。
+        // The release command's bookkeeping is done **first, before every early return**. The interface's
+        // spec for the release command is not conditioned on transport success: when the transport fails, this side cannot know whether the chip has released it;
+        // rather than being uncertain on both sides, it is uniformly treated as "this side no longer tracks it". If this bookkeeping landed after
+        // some `return`, that path would leave behind a handle that has semantically long been given up but that this side
+        // still tracks.
         if cc == CC_FLUSH_CONTEXT {
             self.ledger.observe_flush(Ghost(fh));
         }
 
-        // 接口签名不带状态前提，前提只能在这里补。不满足就直接回绝：一条在
-        // 错误状态下发出的命令，最好的结果也只是浪费一次往返。
+        // The interface signature carries no state precondition, so it can only be supplied here. If not satisfied, refuse outright: a command sent in the
+        // wrong state at best wastes a round trip.
         if !self.x.ready() {
             return Err(IoErr::NotReady);
         }
 
-        // 命令有多长以报文头的自述为准，而不是以缓冲区容量为准——上层传下来
-        // 的往往是一整块暂存区，末尾大片是无关字节，照缓冲区长度发送等于把
-        // 垃圾一起送进器件。
+        // How long the command is goes by what the message header says, not by the buffer capacity -- what the upper layer passes down
+        // is often a whole scratch area with a large tail of unrelated bytes, and sending by buffer length would ship the
+        // garbage into the device as well.
         let declared = peek_be32(cmd, 2);
         if declared < HEADER_SIZE as u32 {
             return Err(IoErr::BadCommand);
@@ -157,10 +157,10 @@ impl<P: TisPhy> ChipTransport for ChipLink<P> {
         let n = match self.x.run(cmd, len, rsp) {
             Ok((n, rc)) => {
                 if cc == CC_CONTEXT_LOAD && rc == RC_SUCCESS {
-                    // 装载成功却装不下一个句柄，说明响应与命令对不上号。这种
-                    // 响应不能采信，也就不能记账——代价是万一芯片确实装载了，
-                    // 那个句柄就此泄漏。宁可泄漏一个句柄，也不能把一个来路不明
-                    // 的数值当作句柄记进表里。
+                    // A load that succeeded but has no room for a handle means the response does not match the command. Such a
+                    // response cannot be trusted and therefore cannot be booked -- at the cost that, if the chip really did load something,
+                    // that handle leaks. Better to leak a handle than to record a value of unknown origin
+                    // in the table as a handle.
                     if n < HEADER_SIZE + 4 {
                         return Err(IoErr::Protocol);
                     }
@@ -178,10 +178,10 @@ impl<P: TisPhy> ChipTransport for ChipLink<P> {
     }
 }
 
-/// 链路错误 → 编排层错误。
+/// Link error -> orchestration-layer error.
 ///
-/// 链路层失败没有返回码可读，因此这里只做「传输语义」上的分类：
-/// 超时可重试，物理故障不可重试，协议帧不可信，命令自描述不自洽。
+/// A link-layer failure has no return code to read, so the classification here is only by "transport semantics":
+/// timeouts are retryable, physical faults are not retryable, the protocol frame cannot be trusted, and the command's self-description is inconsistent.
 pub fn map_err(e: XferErr) -> (r: IoErr) {
     match e {
         XferErr::Bus(crate::tis::TisErr::Phy) => IoErr::Bus,

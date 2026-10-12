@@ -9,60 +9,56 @@ use crate::xfer::Xfer;
 verus! {
 
 // ===========================================================================
-// 家族探测
+// Family probe
 // ===========================================================================
 //
-// 器件是走 1.2 还是 2.0,靠一条命令问出来:发一个 **2.0 帧**的能力查询,然后只
-// 看响应头的标签。2.0 器件认得这个标签、用同一套标签答回;1.2 器件不认,答一个
-// 别的标签。返回码被有意忽略——器件喜不喜欢这条命令无所谓,重要的是它用哪套
-// 标签回话。
+// Whether the device follows 1.2 or 2.0 is found out with one command: send a capability query in a **2.0 frame**, then look only at the
+// tag in the response header. A 2.0 device recognizes the tag and answers with the same set of tags; a 1.2 device does not and answers with a
+// different tag. The return code is deliberately ignored -- whether the device likes the command does not matter; what matters is which set of
+// tags it replies with.
 //
-// 这一层跨在两个家族的协议规则之上,是内核胶水(圈层 C):它不进证明主体,只用
-// `external_body` 声明签名,把整段判定当作可信实现。判定本身不改变任何被证明的
-// 性质——它只决定接下来把链路交给哪条引导序列。
+// This layer sits across the protocol rules of the two families and is kernel glue (ring C): it is not part of the proof body, only
+// declares its signature with `external_body`, treating the whole decision as a trusted implementation. The decision itself changes no proven
+// property -- it only decides which boot sequence the link is handed to next.
 
-/// 器件家族。
+/// Device family.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Family {
-    /// 1.2:走 `tpm1` 路径。
+    /// 1.2: take the `tpm1` path.
     OneTwo,
-    /// 2.0:走根部的会话/授权路径。
+    /// 2.0: take the root session/authorization path.
     TwoZero,
 }
 
-/// 探测用的属性子项:器件实现的命令总数。取哪一项无所谓——探测只看响应标签,
-/// 不看载荷。
+/// Property sub-item used for probing: the total number of commands the device implements. Which one is chosen does not matter -- the probe looks only at the response tag,
+/// not the payload.
 const PT_TOTAL_COMMANDS: u32 = 0x0000_0129;
 
-/// 探测命令总长:头 10 + 三个 u32 载荷。
+/// Total probe command length: 10 header bytes + three u32 payload words.
 const PROBE_LEN: usize = TPM_HEADER_LEN + 12;
 
-/// 探测响应暂存区。只读它的前两个字节(标签),给足头部余量即可。
+/// Probe response scratch buffer. Only its first two bytes (the tag) are read; leaving header-sized slack is enough.
 const PROBE_RSP: usize = 64;
 
-/// 判定器件家族。
+/// Determine the device family.
 ///
-/// 借用链路发一条命令即返回,链路仍归调用方所有,供随后的引导序列接管。链路
-/// 若不处于可发命令的状态,保守判为 1.2——即不启用 2.0 专属路径,宁可少认能力
-/// 也不误把一个没准备好的器件当成 2.0 去跑授权握手。
+/// Borrows the link to send one command and returns immediately; the link remains owned by the caller for the subsequent boot sequence to take over. If the link
+/// is not in a state to send commands, conservatively classify as 1.2 -- i.e. do not enable the 2.0-only path; better to under-recognize capability
+/// than to mistake a not-ready device for 2.0 and run the authorization handshake.
 #[verifier::external_body]
 pub fn probe_family<P: TisPhy>(x: &mut Xfer<P>) -> Family {
     if !x.ready() {
         return Family::OneTwo;
     }
 
-    // 2.0 帧:标签 ST_NO_SESSIONS,命令码 GetCapability。
+    // 2.0 frame: tag ST_NO_SESSIONS, command code GetCapability.
     let hdr = build_header(ST_NO_SESSIONS, CC_GET_CAPABILITY, PROBE_LEN as u32);
     let a = be32_bytes(CAP_TPM_PROPERTIES);
     let b = be32_bytes(PT_TOTAL_COMMANDS);
     let c = be32_bytes(1);
 
     let mut cmd = [0u8; PROBE_LEN];
-    let mut i = 0;
-    while i < TPM_HEADER_LEN {
-        cmd[i] = hdr[i];
-        i += 1;
-    }
+    cmd[..TPM_HEADER_LEN].copy_from_slice(&hdr);
     cmd[TPM_HEADER_LEN] = a[0];
     cmd[TPM_HEADER_LEN + 1] = a[1];
     cmd[TPM_HEADER_LEN + 2] = a[2];
@@ -79,15 +75,15 @@ pub fn probe_family<P: TisPhy>(x: &mut Xfer<P>) -> Family {
     let mut rsp = [0u8; PROBE_RSP];
     match x.run(&cmd, PROBE_LEN, &mut rsp) {
         Ok((_n, _rc)) => {
-            // 只看标签,返回码忽略。
-            let tag = (rsp[0] as u16) * 256 + (rsp[1] as u16);
+            // Look only at the tag; ignore the return code.
+            let tag = u16::from_be_bytes([rsp[0], rsp[1]]);
             if tag == ST_NO_SESSIONS {
                 Family::TwoZero
             } else {
                 Family::OneTwo
             }
         },
-        // 一个字节都没回来:保守判为 1.2。
+        // Not a single byte came back: conservatively classify as 1.2.
         Err(_) => Family::OneTwo,
     }
 }

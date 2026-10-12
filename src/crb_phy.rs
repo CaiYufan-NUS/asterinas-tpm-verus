@@ -5,20 +5,20 @@ use crate::crb::{CMD_BUF_CAP, CrbErr, RSP_BUF_CAP};
 verus! {
 
 // ===========================================================================
-// 物理层：信任基
+// Physical layer: the trust base
 // ===========================================================================
 //
-// CRB 与硬件之间的唯一接触面。运行时语义由具体后端实现保证。
+// The only point of contact between the CRB and the hardware. Runtime semantics are guaranteed by the concrete backend.
 
 pub trait CrbPhy {
-    /// 自上次命令缓冲写入以来，写入命令缓冲的字节序列。
+    /// The byte sequence written to the command buffer since the last command-buffer write.
     ///
-    /// 与 `TisPhy::fifo_written` 的作用相同：把「成功写入了多少字节」变成
-    /// 一条可在断言中引用的规格项，便于验证命令缓冲整块写入的记录。
+    /// Serves the same purpose as `TisPhy::fifo_written`: turns "how many bytes were successfully written" into
+    /// a spec term that assertions can reference, to help record whole-block writes to the command buffer.
     spec fn cmd_written(&self) -> Seq<u8>;
 
     // -----------------------------------------------------------------------
-    // 控制区寄存器
+    // Control-area registers
     // -----------------------------------------------------------------------
 
     fn read32(&mut self, reg: u32) -> (r: Result<u32, CrbErr>)
@@ -32,34 +32,34 @@ pub trait CrbPhy {
     ;
 
     // -----------------------------------------------------------------------
-    // 命令缓冲
+    // Command buffer
     // -----------------------------------------------------------------------
 
-    /// 把 data[0..n] 整块写进命令缓冲头部。
+    /// Write data[0..n] as one block into the head of the command buffer.
     fn write_cmd(&mut self, data: &[u8], n: usize) -> (r: Result<(), CrbErr>)
         ensures
             r is Ok ==> final(self).cmd_written() =~= old(self).cmd_written() + data@.subrange(0, n as int),
             r is Err ==> old(self).cmd_written().is_prefix_of(final(self).cmd_written()),
     ;
 
-    /// 屏障：确保命令缓冲写入在 START 之前对器件可见。
+    /// Barrier: ensures the command-buffer write is visible to the device before START.
     fn fence(&mut self)
         ensures
             final(self).cmd_written() =~= old(self).cmd_written(),
     ;
 
     // -----------------------------------------------------------------------
-    // 响应缓冲
+    // Response buffer
     // -----------------------------------------------------------------------
 
-    /// 从响应缓冲 off 处读取 n 字节，写入 out[off..off+n]。
+    /// Read n bytes from the response buffer at off and write them into out[off..off+n].
     fn read_rsp(&mut self, off: usize, out: &mut [u8], n: usize) -> (r: Result<(), CrbErr>)
         ensures
             final(self).cmd_written() =~= old(self).cmd_written(),
     ;
 
     // -----------------------------------------------------------------------
-    // 节流
+    // Throttling
     // -----------------------------------------------------------------------
 
     fn delay(&mut self)

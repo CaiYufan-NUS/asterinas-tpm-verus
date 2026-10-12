@@ -7,35 +7,35 @@ use crate::endian::{be32_byte, be32_of, lemma_be32_roundtrip};
 
 verus! {
 
-/// 报文头长度：标签 2 字节 + 长度 4 字节 + 命令码或返回码 4 字节。
+/// Message header length: tag 2 bytes + length 4 bytes + command code or return code 4 bytes.
 pub const HEADER_SIZE: usize = 10;
 
-/// 命令句柄数由 3 位字段给出，上限为 7。
+/// The number of command handles is given by a 3-bit field, with an upper limit of 7.
 pub const MAX_CHANDLES: usize = 7;
 
 pub const RC_SUCCESS: u32 = 0;
 
-/// 能力查询里「句柄列表」这一类目。
+/// The "handle list" category in a capability query.
 pub const CAP_HANDLES: u32 = 0x0000_0001;
 
-/// 能力响应体布局：更多数据标志 1 字节，类目 4 字节，数量 4 字节。
+/// Capability response body layout: more-data flag 1 byte, category 4 bytes, count 4 bytes.
 pub const CAP_MORE_OFF: usize = HEADER_SIZE;
-pub const CAP_CAPABILITY_OFF: usize = HEADER_SIZE + 1;
-pub const CAP_COUNT_OFF: usize = HEADER_SIZE + 5;
-pub const CAP_HANDLES_OFF: usize = HEADER_SIZE + 9;
+const CAP_CAPABILITY_OFF: usize = HEADER_SIZE + 1;
+const CAP_COUNT_OFF: usize = HEADER_SIZE + 5;
+const CAP_HANDLES_OFF: usize = HEADER_SIZE + 9;
 
-pub const RSP_LENGTH_OFF: usize = 2;
+const RSP_LENGTH_OFF: usize = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Structural, Debug)]
 pub enum SpaceErr {
-    /// 报文长度与其自身声明的结构不符。
+    /// The message length does not match the structure it declares.
     Malformed,
-    /// 命令引用了一个解析不出来的虚拟句柄。
+    /// The command references a virtual handle that cannot be resolved.
     BadHandle,
 }
 
 // ---------------------------------------------------------------------------
-// 字节访问
+// Byte access
 // ---------------------------------------------------------------------------
 
 pub open spec fn be32_at(s: Seq<u8>, off: int) -> u32 {
@@ -52,7 +52,7 @@ pub fn read_be32(b: &[u8], off: usize) -> (r: u32)
         | (b[off + 3] as u32)
 }
 
-pub fn write_be32(b: &mut [u8], off: usize, v: u32)
+pub(crate) fn write_be32(b: &mut [u8], off: usize, v: u32)
     requires
         off + 4 <= old(b).len(),
     ensures
@@ -71,7 +71,7 @@ pub fn write_be32(b: &mut [u8], off: usize, v: u32)
     b[off + 3] = (v & 0xff) as u8;
 }
 
-/// 命令 / 响应句柄区的第 `k` 个句柄。
+/// The `k`-th handle of the command / response handle area.
 pub open spec fn handle_at(s: Seq<u8>, k: int) -> u32 {
     be32_at(s, HEADER_SIZE + 4 * k)
 }
@@ -110,7 +110,7 @@ proof fn lemma_handle_unchanged_by_write(
     assert(after[base + 3] == before[base + 3]);
 }
 
-/// 句柄改写的规约：瞬态句柄查表，其余原样保留。
+/// Spec of the handle rewrite: transient handles are looked up in the table, the rest are kept as they are.
 pub open spec fn mapped_or_kept(tbl: SpaceTable, h: u32) -> Option<u32> {
     if is_transient(h) {
         tbl.maps(h)
@@ -120,13 +120,13 @@ pub open spec fn mapped_or_kept(tbl: SpaceTable, h: u32) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// 命令方向
+// Command direction
 // ---------------------------------------------------------------------------
 
-/// 把命令句柄区里的虚拟句柄换成物理句柄。
+/// Replace the virtual handles in the command handle area with physical handles.
 ///
-/// `nr_handles` 由命令码的属性表给出，属于阶段 2 的编解码产物；这里只
-/// 把它当成一个已经过校验的参数。
+/// `nr_handles` comes from the command code's attribute table, a product of the phase 2 codec; here it is
+/// treated only as an already validated parameter.
 pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) -> (r: Result<
     (),
     SpaceErr,
@@ -137,28 +137,25 @@ pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) 
         old(cmd).len() >= HEADER_SIZE + 4 * nr_handles,
     ensures
         final(cmd).len() == old(cmd).len(),
-        // 失败时报文原封不动
+        // On failure the message is left untouched
         r.is_err() ==> final(cmd)@ == old(cmd)@,
-        // 头部永不改动
+        // The header is never modified
         forall|k: int| #![trigger final(cmd)@[k]] 0 <= k < HEADER_SIZE ==> final(cmd)@[k] == old(cmd)@[k],
-        // 成功时每个句柄都按规约改写
+        // On success every handle is rewritten per the spec
         r.is_ok() ==> forall|k: int|
             #![trigger handle_at(final(cmd)@, k)]
             0 <= k < nr_handles ==> mapped_or_kept(*tbl, handle_at(old(cmd)@, k)) == Some(
                 handle_at(final(cmd)@, k),
             ),
 {
-    // 第一趟：只读校验。
-    let mut i: usize = 0;
-    while i < nr_handles
+    // First pass: read-only validation.
+    for i in 0..nr_handles
         invariant
-            i <= nr_handles,
             tbl.wf(),
             cmd.len() >= HEADER_SIZE + 4 * nr_handles,
             forall|k: int|
                 #![trigger handle_at(cmd@, k)]
                 0 <= k < i ==> mapped_or_kept(*tbl, handle_at(cmd@, k)).is_some(),
-        decreases nr_handles - i,
     {
         let h = read_be32(cmd, HEADER_SIZE + 4 * i);
         if is_transient_exec(h) {
@@ -166,10 +163,9 @@ pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) 
                 return Err(SpaceErr::BadHandle);
             }
         }
-        i += 1;
     }
 
-    // 第二趟：落笔。此时每个句柄都保证可解析，不会中途失败。
+    // Second pass: commit the writes. At this point every handle is guaranteed resolvable, so it cannot fail midway.
     let ghost orig = cmd@;
     proof {
         assert forall|k: int|
@@ -178,10 +174,8 @@ pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) 
             assert(handle_at(orig, k) == handle_at(cmd@, k));
         }
     }
-    let mut i: usize = 0;
-    while i < nr_handles
+    for i in 0..nr_handles
         invariant
-            i <= nr_handles,
             tbl.wf(),
             cmd.len() == orig.len(),
             cmd.len() >= HEADER_SIZE + 4 * nr_handles,
@@ -189,17 +183,16 @@ pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) 
             forall|k: int|
                 #![trigger handle_at(orig, k)]
                 0 <= k < nr_handles as int ==> mapped_or_kept(*tbl, handle_at(orig, k)).is_some(),
-            // 尚未处理的句柄保持原值
+            // Handles not yet processed keep their original values
             forall|k: int|
                 #![trigger handle_at(cmd@, k)]
                 (i as int <= k && k < nr_handles as int) ==> handle_at(cmd@, k) == handle_at(orig, k),
-            // 已处理的句柄符合规约
+            // Handles already processed conform to the spec
             forall|k: int|
                 #![trigger handle_at(cmd@, k)]
                 0 <= k < i as int ==> mapped_or_kept(*tbl, handle_at(orig, k)) == Some(
                     handle_at(cmd@, k),
                 ),
-        decreases nr_handles - i,
     {
         let ghost before_iter = cmd@;
         let h = read_be32(cmd, HEADER_SIZE + 4 * i);
@@ -252,34 +245,33 @@ pub fn map_command_handles(tbl: &SpaceTable, nr_handles: usize, cmd: &mut [u8]) 
             }
         }
 
-        i += 1;
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 响应方向
+// Response direction
 // ---------------------------------------------------------------------------
 
-/// 响应头句柄的处理结果。
+/// The outcome of handling the response header handle.
 ///
-/// `OutOfSlots` 把「必须释放这个物理句柄」这条义务写进了返回值类型，
-/// 而不是留给调用方凭约定记住。编排层不处理它就编译不过。
+/// `OutOfSlots` writes the obligation "this physical handle must be released" into the return type,
+/// rather than leaving the caller to remember it by convention. If the orchestration layer does not handle it, the code does not compile.
 #[derive(Clone, Copy, PartialEq, Eq, Structural)]
 pub enum HeaderOutcome {
-    /// 响应里没有句柄，或命令本身失败，报文未改动。
+    /// The response has no handle, or the command itself failed; the message is unchanged.
     NoHandle,
-    /// 瞬态句柄已替换为虚拟句柄。
+    /// The transient handle has been replaced with a virtual handle.
     Virtualized { vhandle: u32 },
-    /// 会话句柄已登记，报文未改动（会话句柄不虚拟化）。
+    /// The session handle has been registered; the message is unchanged (session handles are not virtualized).
     SessionTracked { phandle: u32 },
-    /// 句柄类型不认识，报文未改动。
+    /// Unrecognized handle type; the message is unchanged.
     Unknown { phandle: u32 },
-    /// 表已满，必须释放 `flush`。
+    /// The table is full; `flush` must be performed.
     OutOfSlots { flush: u32 },
 }
 
-/// 该结果是否意味着报文被改写过。
+/// Whether this outcome means the message was rewritten.
 pub open spec fn outcome_rewrites(r: HeaderOutcome) -> bool {
     match r {
         HeaderOutcome::Virtualized { .. } => true,
@@ -287,7 +279,7 @@ pub open spec fn outcome_rewrites(r: HeaderOutcome) -> bool {
     }
 }
 
-/// 处理响应头部返回的句柄。
+/// Handle the handle returned in the response header.
 pub fn map_response_handle(tbl: &mut SpaceTable, has_rhandle: bool, rsp: &mut [u8]) -> (r:
     HeaderOutcome)
     requires
@@ -296,7 +288,7 @@ pub fn map_response_handle(tbl: &mut SpaceTable, has_rhandle: bool, rsp: &mut [u
     ensures
         final(tbl).wf(),
         final(rsp).len() == old(rsp).len(),
-        // 只有虚拟化这一种情况会改动报文，且只改那 4 个字节
+        // Only virtualization modifies the message, and only those 4 bytes
         !outcome_rewrites(r) ==> final(rsp)@ == old(rsp)@,
         forall|k: int|
             #![trigger final(rsp)@[k]]
@@ -315,7 +307,7 @@ pub fn map_response_handle(tbl: &mut SpaceTable, has_rhandle: bool, rsp: &mut [u
 
     if is_transient_exec(phandle) {
         if phandle == 0 || phandle == CTX_SAVED_SENTINEL || tbl.lookup(phandle).is_some() {
-            // 非法或重复的物理句柄：不接管，交回上层释放。
+            // Invalid or duplicate physical handle: not taken over, handed back to the upper layer to release.
             return HeaderOutcome::OutOfSlots { flush: phandle };
         }
         match tbl.intern(phandle) {
@@ -339,13 +331,13 @@ pub fn map_response_handle(tbl: &mut SpaceTable, has_rhandle: bool, rsp: &mut [u
     }
 }
 
-/// 改写能力查询响应里的句柄列表：瞬态句柄换成虚拟句柄，本 space 不认识的
-/// 瞬态句柄**从列表中剔除**，其余原样保留。列表就地压紧，长度字段与
-/// 数量字段一并更新。
+/// Rewrite the handle list in a capability query response: transient handles are replaced with virtual handles, and transient
+/// handles this space does not recognize are **removed from the list**, the rest kept as they are. The list is compacted in place, and the length field and
+/// count field are updated together.
 ///
-/// 剔除是隔离性的直接体现：一个 space 枚举瞬态对象时，只应看见自己的。
+/// Removal is a direct expression of isolation: when a space enumerates transient objects, it should see only its own.
 ///
-/// 返回改写后的报文总长度。
+/// Returns the total length of the rewritten message.
 pub fn map_capability_handles(tbl: &SpaceTable, is_cap_query: bool, rsp: &mut [u8], len: usize)
     -> (r: Result<usize, SpaceErr>)
     requires
@@ -370,7 +362,7 @@ pub fn map_capability_handles(tbl: &SpaceTable, is_cap_query: bool, rsp: &mut [u
         return Ok(len);
     }
 
-    // 先算容量再比对，避免任何乘法。
+    // Compute the capacity first and then compare, avoiding any multiplication.
     let tail = len - CAP_HANDLES_OFF;
     if tail % 4 != 0 {
         return Err(SpaceErr::Malformed);
@@ -383,15 +375,13 @@ pub fn map_capability_handles(tbl: &SpaceTable, is_cap_query: bool, rsp: &mut [u
     let count: usize = avail;
 
     let ghost orig = rsp@;
-    let mut i: usize = 0;
     let mut j: usize = 0;
-    while i < count
+    for i in 0..count
         invariant
             j <= i <= count,
             tbl.wf(),
             rsp.len() == orig.len(),
             CAP_HANDLES_OFF + 4 * count <= rsp.len(),
-        decreases count - i,
     {
         let h = read_be32(rsp, CAP_HANDLES_OFF + 4 * i);
         if is_transient_exec(h) {
@@ -401,14 +391,13 @@ pub fn map_capability_handles(tbl: &SpaceTable, is_cap_query: bool, rsp: &mut [u
                         write_be32(rsp, CAP_HANDLES_OFF + 4 * j, v);
                         j += 1;
                     },
-                    None => {},  // 不属于本 space，剔除
+                    None => {},  // Not in this space; drop it
                 }
             }
         } else {
             write_be32(rsp, CAP_HANDLES_OFF + 4 * j, h);
             j += 1;
         }
-        i += 1;
     }
 
     let new_len = CAP_HANDLES_OFF + 4 * j;

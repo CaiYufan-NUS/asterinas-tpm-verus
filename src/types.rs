@@ -1,30 +1,30 @@
-//! 报文首部字段的类型封装。
+//! Type wrappers for message header fields.
 //!
-//! yufan：**当前只有 `buf` 用到 `TpmTag`,`TpmRc` 尚无调用方。** 拼装与解析各层
-//! 直接对裸 `u16` / `u32` 操作,把标签和返回码的取值约束写在函数的前后置
-//! 条件里,没有绕道这里。
+//! yufan: **Currently only `buf` uses `TpmTag`; `TpmRc` has no callers yet.** The assembly and parsing layers
+//! operate directly on raw `u16` / `u32`, stating the value constraints of tags and return codes in the
+//! pre/postconditions of functions rather than going through this module.
 //!
-//! 留着是为了 `TpmRc` 那件事:返回码与命令码复用报文首部的同一个偏移,
-//! 两者混用同一个裸 `u32` 时写反了不会被任何检查发现。真要收紧,应该是
-//! 让各层改用这个 newtype,而不是反过来把它删掉。
+//! It is kept because of `TpmRc`: return codes and command codes share the same offset in the message header,
+//! and if both are carried in the same raw `u32`, swapping them goes undetected by any check. To tighten this,
+//! the layers should switch to this newtype, rather than deleting it.
 use vstd::prelude::*;
 
 verus! {
 
 // ---------------------------------------------------------------------------
-// 命令 / 响应 tag
+// Command / response tag
 // ---------------------------------------------------------------------------
 
-/// TPM 报文首部的 tag 字段。
+/// The tag field of the TPM message header.
 #[derive(Clone, Copy)]
 pub enum TpmTag {
-    /// `TPM_TAG_RQU_COMMAND` = 193（TPM 1.2 命令）
+    /// `TPM_TAG_RQU_COMMAND` = 193 (TPM 1.2 command)
     RquCommand,
     /// `TPM2_ST_NO_SESSIONS` = 0x8001
     Tpm2NoSessions,
     /// `TPM2_ST_SESSIONS` = 0x8002
     Tpm2Sessions,
-    /// 0 —— `tpm_buf_reset()` 显式允许（用于尚未定型的缓冲区）
+    /// 0 -- explicitly allowed by `tpm_buf_reset()` (for buffers not yet finalized)
     Null,
 }
 
@@ -50,7 +50,7 @@ impl TpmTag {
         }
     }
 
-    /// 解析线上字节。
+    /// Parse the on-wire bytes.
     pub fn from_code(c: u16) -> (r: Option<TpmTag>)
         ensures
             match r {
@@ -71,7 +71,7 @@ impl TpmTag {
         }
     }
 
-    /// 该 tag 是否属于 TPM2 报文族。
+    /// Whether this tag belongs to the TPM2 message family.
     pub open spec fn is_tpm2(self) -> bool {
         match self {
             TpmTag::Tpm2NoSessions => true,
@@ -82,12 +82,12 @@ impl TpmTag {
 }
 
 // ---------------------------------------------------------------------------
-// 返回码
+// Return code
 // ---------------------------------------------------------------------------
 
-/// TPM 返回码（首部第 3 个字段，与 ordinal 复用同一偏移）。
-/// newtype 而非 enum：返回码空间开放（含厂商自定义），穷举不现实，
-/// 但至少不再与 ordinal 混用同一个裸 `u32`。
+/// TPM return code (the 3rd field of the header, sharing the same offset as the ordinal).
+/// A newtype rather than an enum: the return-code space is open (including vendor-defined codes), so exhaustive enumeration is impractical,
+/// but at least it is no longer mixed with the ordinal in the same raw `u32`.
 #[derive(Clone, Copy)]
 pub struct TpmRc(pub u32);
 
@@ -119,7 +119,7 @@ impl TpmRc {
 }
 
 // ---------------------------------------------------------------------------
-// 尺寸常量（来自 tpm.h）
+// Size constants (from tpm.h)
 // ---------------------------------------------------------------------------
 
 /// `TPM_BUFSIZE`

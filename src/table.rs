@@ -4,18 +4,18 @@ use super::handle::*;
 
 verus! {
 
-/// 上下文表的槽位状态。
+/// Slot states of the context table.
 #[derive(Clone, Copy, PartialEq, Eq, Structural)]
 pub enum CtxSlot {
-    /// 空闲槽位。
+    /// Free slot.
     Empty,
-    /// 对象内容已保存到备份缓冲区，芯片上无对应句柄。
+    /// The object content has been saved to the backup buffer; there is no corresponding handle on the chip.
     Saved,
-    /// 槽位持有一个活跃的物理句柄。
+    /// The slot holds a live physical handle.
     Live(u32),
 }
 
-/// 活跃槽位的物理句柄。
+/// The physical handle of a live slot.
 pub open spec fn live_handle(s: CtxSlot) -> Option<u32> {
     match s {
         CtxSlot::Live(h) => Some(h),
@@ -23,7 +23,7 @@ pub open spec fn live_handle(s: CtxSlot) -> Option<u32> {
     }
 }
 
-/// 表的抽象状态。字段全公开，供上层写规约。
+/// Abstract state of the table. All fields are public, for upper layers to write specs.
 pub struct TableView {
     pub ctx: Seq<CtxSlot>,
     pub sessions: Seq<u32>,
@@ -32,7 +32,7 @@ pub struct TableView {
 #[derive(Clone, Copy)]
 pub struct SpaceTable {
     ctx: [CtxSlot; SLOTS],
-    /// `0` 表示空槽。
+    /// `0` means an empty slot.
     sessions: [u32; SLOTS],
 }
 
@@ -42,25 +42,25 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 不变量
+    // Invariants
     // -----------------------------------------------------------------------
 
     pub open spec fn wf(&self) -> bool {
         let v = self.abs();
         &&& v.ctx.len() == SLOTS
         &&& v.sessions.len() == SLOTS
-        // 活跃槽位持有的句柄必须是合法物理句柄
+        // A handle held by a live slot must be a valid physical handle
         &&& forall|i: int|
             #![trigger v.ctx[i]]
             0 <= i < SLOTS && live_handle(v.ctx[i]).is_some()
                 ==> valid_phandle(live_handle(v.ctx[i]).unwrap())
-        // 活跃槽位之间物理句柄两两不等 —— 单射性的来源
+        // Physical handles of any two live slots are distinct -- the source of injectivity
         &&& forall|i: int, j: int|
             #![trigger v.ctx[i], v.ctx[j]]
             0 <= i < SLOTS && 0 <= j < SLOTS && i != j
                 && live_handle(v.ctx[i]).is_some()
                 ==> live_handle(v.ctx[i]) != live_handle(v.ctx[j])
-        // 已登记的会话句柄两两不等
+        // Registered session handles are pairwise distinct
         &&& forall|i: int, j: int|
             #![trigger v.sessions[i], v.sessions[j]]
             0 <= i < SLOTS && 0 <= j < SLOTS && i != j && v.sessions[i] != 0u32
@@ -68,7 +68,7 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 规约层查询
+    // Spec-level queries
     // -----------------------------------------------------------------------
 
     pub open spec fn slot(&self, i: int) -> CtxSlot {
@@ -79,14 +79,14 @@ impl SpaceTable {
         self.abs().sessions[i]
     }
 
-    /// 表中是否已经登记了物理句柄 `p`。
+    /// Whether physical handle `p` is already registered in the table.
     pub open spec fn has_phandle(&self, p: u32) -> bool {
         exists|i: int|
             #![trigger self.slot(i)]
             0 <= i < SLOTS && live_handle(self.slot(i)) == Some(p)
     }
 
-    /// 虚拟句柄到物理句柄的映射。整个模块的语义核心。
+    /// The mapping from virtual handles to physical handles. The semantic core of the whole module.
     pub open spec fn maps(&self, v: u32) -> Option<u32> {
         let i = slot_of(v);
         if is_transient(v) && 0 <= i < SLOTS {
@@ -97,11 +97,11 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 存在量词的展开引理
+    // Lemmas unfolding the existential quantifier
     //
-    // `has_phandle` / `has_session` 是存在量词形式，便于上层书写；而维护
-    // 不变量时需要的是「逐槽位都不等」的全称形式。这两条引理是两种形式
-    // 之间唯一的桥，写入槽位的三个函数都从它们起步。
+    // `has_phandle` / `has_session` are in existential form, convenient for upper layers to write; maintaining the
+    // invariants, however, needs the universal form "distinct at every slot". These two lemmas are the only bridge
+    // between the two forms, and the three functions that write slots all start from them.
     // -----------------------------------------------------------------------
 
     pub proof fn lemma_no_phandle_pointwise(&self, p: u32)
@@ -131,14 +131,14 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 双射性
+    // Bijectivity
     // -----------------------------------------------------------------------
 
-    /// 映射是单射：两个不同的虚拟句柄不可能指向同一个物理句柄。
+    /// The mapping is injective: two different virtual handles cannot point to the same physical handle.
     ///
-    /// space 之间的隔离性最终要归约到这条性质：一个 space 的表里拿不出
-    /// 另一个 space 持有的物理句柄，因为它的每个虚拟句柄都只能解析到
-    /// 自己表内某个槽位。
+    /// Isolation between spaces ultimately reduces to this property: the table of one space cannot yield a physical handle held by
+    /// another space, because each of its virtual handles can only resolve to some slot
+    /// within its own table.
     pub proof fn lemma_maps_injective(&self, a: u32, b: u32)
         requires
             self.wf(),
@@ -159,7 +159,7 @@ impl SpaceTable {
         lemma_transient_slot_injective(a, b);
     }
 
-    /// 登记后立刻解析回原物理句柄。
+    /// Immediately after registration, it resolves back to the original physical handle.
     pub proof fn lemma_intern_resolve(&self, i: int, p: u32)
         requires
             0 <= i < SLOTS,
@@ -172,7 +172,7 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 构造与槽位写入
+    // Construction and slot writes
     // -----------------------------------------------------------------------
 
     pub fn new() -> (r: Self)
@@ -184,7 +184,7 @@ impl SpaceTable {
         SpaceTable { ctx: [CtxSlot::Empty; SLOTS], sessions: [0u32; SLOTS] }
     }
 
-    /// 把槽位置为空闲或已保存。这两种状态不携带句柄，永远不破坏不变量。
+    /// Set a slot to free or saved. These two states carry no handle and never break the invariants.
     pub fn set_slot_free(&mut self, i: usize, saved: bool)
         requires
             old(self).wf(),
@@ -198,11 +198,11 @@ impl SpaceTable {
         self.ctx[i] = if saved { CtxSlot::Saved } else { CtxSlot::Empty };
     }
 
-    /// 把槽位置为活跃。要求句柄合法且未被登记过。
+    /// Set a slot to live. Requires the handle to be valid and not already registered.
     ///
-    /// 「未被登记过」是前置条件而不是运行时检查：调用点（`intern`、
-    /// 装载路径）本来就已经查过一遍表，再查一次纯属浪费。单射性由此
-    /// 条前置条件承接，不引入任何信任假设。
+    /// "Not already registered" is a precondition rather than a runtime check: the call sites (`intern`, the
+    /// load path) have already looked the table up once, and checking again would be pure waste. Injectivity is carried by this
+    /// precondition, introducing no trust assumption.
     pub fn set_slot_live(&mut self, i: usize, p: u32)
         requires
             old(self).wf(),
@@ -230,7 +230,7 @@ impl SpaceTable {
             assert(self.abs().sessions.len() == SLOTS);
             assert(old(self).wf());
 
-            // 合法性：新槽位由前置条件保证，其余槽位沿用旧值。
+            // Validity: the new slot is guaranteed by the precondition, the other slots keep their old values.
             assert forall|a: int|
                 0 <= a < SLOTS && live_handle(#[trigger] self.slot(a)).is_some()
                 implies valid_phandle(live_handle(self.slot(a)).unwrap()) by {
@@ -248,7 +248,7 @@ impl SpaceTable {
                 }
             }
 
-            // 单射性：三种情况，每种都归到「旧槽位的句柄不等于 p」。
+            // Injectivity: three cases, each reducing to "the handle of an old slot is not equal to p".
             assert forall|a: int, b: int|
                 0 <= a < SLOTS && 0 <= b < SLOTS && a != b
                     && live_handle(#[trigger] self.slot(a)).is_some()
@@ -318,10 +318,10 @@ impl SpaceTable {
     }
 
     // -----------------------------------------------------------------------
-    // 查询与分配
+    // Query and allocation
     // -----------------------------------------------------------------------
 
-    /// 虚拟句柄 → 物理句柄。
+    /// Virtual handle -> physical handle.
     pub fn resolve(&self, v: u32) -> (r: Option<u32>)
         requires
             self.wf(),
@@ -341,7 +341,7 @@ impl SpaceTable {
         }
     }
 
-    /// 物理句柄 → 虚拟句柄，仅查询，不分配。
+    /// Physical handle -> virtual handle; query only, no allocation.
     pub fn lookup(&self, p: u32) -> (r: Option<u32>)
         requires
             self.wf(),
@@ -350,14 +350,11 @@ impl SpaceTable {
             r.is_some() ==> self.maps(r.unwrap()) == Some(p),
             r.is_none() ==> !self.has_phandle(p),
     {
-        let mut i: usize = 0;
-        while i < SLOTS
+        for i in 0..SLOTS
             invariant
-                i <= SLOTS,
                 self.wf(),
                 valid_phandle(p),
                 forall|k: int| #![trigger self.slot(k)] 0 <= k < i ==> live_handle(self.slot(k)) != Some(p),
-            decreases SLOTS - i,
         {
             if self.ctx[i] == CtxSlot::Live(p) {
                 proof {
@@ -365,15 +362,14 @@ impl SpaceTable {
                 }
                 return Some(vhandle_of_exec(i));
             }
-            i += 1;
         }
         None
     }
 
-    /// 为物理句柄分配一个空闲槽位，返回对应虚拟句柄。
+    /// Allocate a free slot for a physical handle and return the corresponding virtual handle.
     ///
-    /// 表满时返回 `None`；此时调用方**有义务**把这个物理句柄在芯片上释放，
-    /// 否则它会一直占着芯片资源且再也无法被引用。
+    /// Returns `None` when the table is full; the caller is then **obliged** to release this physical handle on the chip,
+    /// otherwise it keeps occupying chip resources forever and can never be referenced again.
     pub fn intern(&mut self, p: u32) -> (r: Option<u32>)
         requires
             old(self).wf(),
@@ -385,15 +381,12 @@ impl SpaceTable {
             r.is_some() ==> final(self).maps(r.unwrap()) == Some(p),
             r.is_none() ==> final(self).abs() == old(self).abs(),
     {
-        let mut i: usize = 0;
-        while i < SLOTS
+        for i in 0..SLOTS
             invariant
-                i <= SLOTS,
                 self.wf(),
                 valid_phandle(p),
                 !self.has_phandle(p),
                 self.abs() == old(self).abs(),
-            decreases SLOTS - i,
         {
             if self.ctx[i] == CtxSlot::Empty {
                 self.set_slot_live(i, p);
@@ -402,20 +395,19 @@ impl SpaceTable {
                 }
                 return Some(vhandle_of_exec(i));
             }
-            i += 1;
         }
         None
     }
 
     // -----------------------------------------------------------------------
-    // 会话表
+    // Session table
     // -----------------------------------------------------------------------
 
     pub open spec fn has_session(&self, h: u32) -> bool {
         exists|i: int| #![trigger self.session(i)] 0 <= i < SLOTS && self.session(i) == h
     }
 
-    /// 登记一个会话句柄。表满时返回 `false`，调用方同样负有释放义务。
+    /// Register a session handle. Returns `false` when the table is full; the caller is likewise obliged to release it.
     pub fn add_session(&mut self, h: u32) -> (r: bool)
         requires
             old(self).wf(),
@@ -427,15 +419,12 @@ impl SpaceTable {
             r ==> final(self).has_session(h),
             !r ==> final(self).abs() == old(self).abs(),
     {
-        let mut i: usize = 0;
-        while i < SLOTS
+        for i in 0..SLOTS
             invariant
-                i <= SLOTS,
                 self.wf(),
                 h != 0u32,
                 !self.has_session(h),
                 self.abs() == old(self).abs(),
-            decreases SLOTS - i,
         {
             if self.sessions[i] == 0 {
                 let ghost before = self.sessions@;
@@ -481,7 +470,7 @@ impl SpaceTable {
                         assert(prev.wf());
                     }
 
-                    // 两两不等：新写入的 h 与任何旧值都不同，旧值之间沿用旧不变量。
+                    // Pairwise distinct: the newly written h differs from any old value, and the old values keep the old invariant among themselves.
                     assert forall|a: int, b: int|
                         0 <= a < SLOTS && 0 <= b < SLOTS && a != b && #[trigger] self.session(a) != 0u32
                         implies self.session(a) != #[trigger] self.session(b) by {
@@ -496,7 +485,7 @@ impl SpaceTable {
                             assert(self.session(b) == prev.session(b));
                         }
                     }
-                    // 存在性见证：槽位 i 就是。
+                    // Existence witness: slot i is it.
                     assert(self.session(i as int) == h);
                     assert(self.has_session(h));
 
@@ -537,7 +526,6 @@ impl SpaceTable {
                 }
                 return true;
             }
-            i += 1;
         }
         false
     }
@@ -548,13 +536,10 @@ impl SpaceTable {
         ensures
             r == self.has_session(h),
     {
-        let mut i: usize = 0;
-        while i < SLOTS
+        for i in 0..SLOTS
             invariant
-                i <= SLOTS,
                 self.wf(),
                 forall|k: int| #![trigger self.session(k)] 0 <= k < i ==> self.session(k) != h,
-            decreases SLOTS - i,
         {
             if self.sessions[i] == h {
                 proof {
@@ -563,7 +548,6 @@ impl SpaceTable {
                 }
                 return true;
             }
-            i += 1;
         }
         proof {
             assert forall|k: int| 0 <= k < SLOTS implies #[trigger] self.session(k) != h by {}

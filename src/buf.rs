@@ -1,14 +1,14 @@
-//! 定长命令缓冲区。
+//! Fixed-size command buffer.
 //!
-//! yufan：**本类型当前不在命令拼装路径上。** 引导阶段的命令由 `boot` 就地写进
-//! 自己的定长暂存区,带授权的命令由 `secure::CmdLayout` 描述分区,两条路
-//! 都不经过这里。它保留下来是因为「先写载荷、再回填长度」这种拼装方式
-//! 迟早会有需要,而不是因为有现成的调用方。
+//! yufan: **This type is currently not on the command assembly path.** Boot-phase commands are written by `boot` in place into
+//! its own fixed scratch area, and authorized commands have their partitions described by `secure::CmdLayout`; neither
+//! path goes through here. It is kept because the "write the payload first, then fill in the length" assembly style
+//! will sooner or later be needed, not because there is an existing caller.
 //!
-//! 因此在给它找到确定用途之前,新命令请照着上述两条路写,不要以它为样板:
-//! 它的错误模型是 `overflow` / `boundary_error` 两个粘滞标志、末尾统一收,
-//! 与其余各层就地返回 `Result` 的做法不是一回事;字节序也走 `endian`
-//! 而非 `cursor`。两种做法并存已经够了,不宜再多一处。
+//! Therefore, until a definite use is found for it, write new commands after the two paths above and do not use it as a template:
+//! its error model is two sticky flags, `overflow` / `boundary_error`, collected at the end,
+//! which is not the same as the other layers' practice of returning `Result` in place; byte order also goes through `endian`
+//! rather than `cursor`. Two practices coexisting is already enough; there should not be a third.
 use vstd::prelude::*;
 use vstd::array::*;
 use vstd::slice::*;
@@ -18,20 +18,20 @@ use crate::types::TpmTag;
 
 verus! {
 
-/// `struct tpm_header` 的大小：tag(2) + length(4) + ordinal/return_code(4)。
+/// Size of `struct tpm_header`: tag(2) + length(4) + ordinal/return_code(4).
 pub const TPM_HEADER_SIZE: usize = 10;
 
-/// TPM2B 首部：仅一个 16 位 size 字段。
+/// TPM2B header: just one 16-bit size field.
 pub const TPM2B_HEADER_SIZE: usize = 2;
 
 // ===========================================================================
-// 圈层 B：存储获取（唯一的 external_body）
+// Ring B: storage acquisition (the only external_body)
 // ===========================================================================
 
-/// 内核胶水层应把它重新实现为页分配并 **Box 化**，避免 4 KiB 落在内核栈上；
-/// 这里的默认实现只用于 host 侧差分测试。
+/// The kernel glue layer should reimplement it as a page allocation and **Box it**, to keep 4 KiB off the kernel stack;
+/// the default implementation here is used only for host-side differential testing.
 #[verifier::external_body]
-pub fn alloc_zeroed_storage<const N: usize>() -> (r: [u8; N])
+fn alloc_zeroed_storage<const N: usize>() -> (r: [u8; N])
     ensures
         r@.len() == N,
         forall|i: int| 0 <= i < N ==> r@[i] == 0u8,
@@ -40,15 +40,15 @@ pub fn alloc_zeroed_storage<const N: usize>() -> (r: [u8; N])
 }
 
 // ===========================================================================
-// 缓冲区
+// Buffer
 // ===========================================================================
 
-/// 它与 `overflow`/`boundary_error` 的区别在于：种类在构造时确定、此后不变，
+/// It differs from `overflow`/`boundary_error` in that the kind is fixed at construction and never changes afterwards.
 #[derive(Clone, Copy)]
 pub enum BufKind {
-    /// 普通命令缓冲区，首部为 `struct tpm_header`
+    /// Ordinary command buffer, header is `struct tpm_header`
     Command,
-    /// TPM2B 缓冲区，首部为 2 字节 size
+    /// TPM2B buffer, header is a 2-byte size
     Tpm2b,
 }
 
@@ -63,7 +63,7 @@ pub struct TpmBuf<const N: usize> {
 
 impl<const N: usize> TpmBuf<N> {
     // -----------------------------------------------------------------
-    // 规约层
+    // Spec layer
     // -----------------------------------------------------------------
 
     pub closed spec fn spec_is_tpm2b(self) -> bool {
@@ -73,7 +73,7 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 首部长度：TPM2B 为 2，命令为 10。
+    /// Header length: 2 for TPM2B, 10 for a command.
     pub open spec fn hdr_len(self) -> int {
         if self.spec_is_tpm2b() {
             TPM2B_HEADER_SIZE as int
@@ -82,8 +82,8 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 缓冲区**自身字节里编码的**总长度。
-    /// 注意 TPM2B 的 size 字段不含它自己的 2 字节，故 `+2`。
+    /// The total length **encoded in the buffer's own bytes**.
+    /// Note that the TPM2B size field does not include its own 2 bytes, hence `+2`.
     pub open spec fn encoded_len(self) -> int {
         if self.spec_is_tpm2b() {
             be16_of(self.data@[0], self.data@[1]) as int + 2
@@ -92,7 +92,7 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 核心不变量。
+    /// Core invariant.
     pub open spec fn wf(self) -> bool {
         &&& self.data@.len() == N
         &&& self.hdr_len() <= N as int
@@ -102,12 +102,12 @@ impl<const N: usize> TpmBuf<N> {
         &&& self.encoded_len() == self.length as int
     }
 
-    /// 首部之后的有效载荷。
+    /// The payload after the header.
     pub open spec fn payload(self) -> Seq<u8> {
         self.data@.subrange(self.hdr_len(), self.length as int)
     }
 
-    /// 会真正交给硬件的线上字节序列。
+    /// The on-wire byte sequence that is actually handed to the hardware.
     pub open spec fn wire(self) -> Seq<u8> {
         self.data@.subrange(0, self.length as int)
     }
@@ -128,7 +128,7 @@ impl<const N: usize> TpmBuf<N> {
         self.handles as int
     }
 
-    /// 「内容完全没变」——用于表达 no-op 与只读操作。
+    /// "Content entirely unchanged" -- used to express no-ops and read-only operations.
     pub open spec fn content_eq(self, other: TpmBuf<N>) -> bool {
         &&& self.data@ =~= other.data@
         &&& self.length == other.length
@@ -136,7 +136,7 @@ impl<const N: usize> TpmBuf<N> {
         &&& self.handles == other.handles
     }
 
-    /// 从 `offset` 起还能安全读出 `count` 字节。
+    /// Whether `count` bytes can safely be read starting at `offset`.
     pub open spec fn can_read(self, offset: int, count: int) -> bool {
         &&& !self.boundary_error
         &&& 0 <= offset
@@ -144,7 +144,7 @@ impl<const N: usize> TpmBuf<N> {
     }
 
     // -----------------------------------------------------------------
-    // 内部：定点写入
+    // Internal: fixed-position writes
     // -----------------------------------------------------------------
 
     fn put_be16(&mut self, at: usize, v: u16)
@@ -191,7 +191,7 @@ impl<const N: usize> TpmBuf<N> {
         self.data[at + 3] = (v & 0xff) as u8;
     }
 
-    /// 把 `self.length` 回写进首部的长度字段。
+    /// Write `self.length` back into the header's length field.
     fn sync_length(&mut self)
         requires
             old(self).data@.len() == N,
@@ -211,8 +211,8 @@ impl<const N: usize> TpmBuf<N> {
     {
         match self.kind {
             BufKind::Tpm2b => {
-                // length >= 2 由前置条件保证，故减法不下溢；
-                // length <= N <= 0xffff 故转 u16 无截断。
+                // length >= 2 is guaranteed by the precondition, so the subtraction cannot underflow;
+                // length <= N <= 0xffff, so the cast to u16 does not truncate.
                 let sz: u16 = (self.length - TPM2B_HEADER_SIZE) as u16;
                 self.put_be16(0, sz);
                 proof {
@@ -230,10 +230,10 @@ impl<const N: usize> TpmBuf<N> {
     }
 
     // -----------------------------------------------------------------
-    // 构造与复位
+    // Construction and reset
     // -----------------------------------------------------------------
 
-    /// 对应 `tpm_buf_reset()`：在既有存储上原地初始化一条命令。
+    /// Corresponds to `tpm_buf_reset()`: initialize a command in place on existing storage.
     pub fn reset_command(&mut self, tag: TpmTag, ordinal: u32)
         requires
             old(self).data@.len() == N,
@@ -273,7 +273,7 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 对应 `tpm_buf_reset_sized()`。
+    /// Corresponds to `tpm_buf_reset_sized()`.
     pub fn reset_sized(&mut self)
         requires
             old(self).data@.len() == N,
@@ -300,7 +300,7 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 对应 `tpm_buf_init()`：分配 + 初始化。
+    /// Corresponds to `tpm_buf_init()`: allocate + initialize.
     pub fn new_command(tag: TpmTag, ordinal: u32) -> (r: Self)
         requires
             TPM_HEADER_SIZE <= N,
@@ -326,7 +326,7 @@ impl<const N: usize> TpmBuf<N> {
         buf
     }
 
-    /// 对应 `tpm_buf_init_sized()`。
+    /// Corresponds to `tpm_buf_init_sized()`.
     pub fn new_sized() -> (r: Self)
         requires
             TPM2B_HEADER_SIZE <= N,
@@ -352,13 +352,13 @@ impl<const N: usize> TpmBuf<N> {
         buf
     }
 
-    // `tpm_buf_destroy()` 无对应物：所有权与 Drop 自动处理。
+    // `tpm_buf_destroy()` has no counterpart: ownership and Drop handle it automatically.
 
     // -----------------------------------------------------------------
-    // 写入
+    // Writing
     // -----------------------------------------------------------------
 
-    /// 对应 `tpm_buf_append()`。
+    /// Corresponds to `tpm_buf_append()`.
     pub fn append(&mut self, src: &[u8])
         requires
             old(self).wf(),
@@ -367,15 +367,15 @@ impl<const N: usize> TpmBuf<N> {
             final(self).spec_is_tpm2b() == old(self).spec_is_tpm2b(),
             final(self).boundary_error == old(self).boundary_error,
             final(self).handles == old(self).handles,
-            // (1) 已溢出：完全 no-op
+            // (1) Already overflowed: complete no-op
             old(self).overflow ==> (final(self).overflow && final(self).content_eq(*old(self))),
-            // (2) 装得下：内容追加，长度字段同步
+            // (2) Fits: content is appended, length field synchronized
             (!old(self).overflow && src@.len() + old(self).length as int <= N as int) ==> (
                 !final(self).overflow
                 && final(self).length as int == old(self).length as int + src@.len()
                 && final(self).payload() =~= old(self).payload() + src@
             ),
-            // (3) 装不下：置标志，一字节不改
+            // (3) Does not fit: set the flag, change not a single byte
             (!old(self).overflow && src@.len() + old(self).length as int > N as int) ==> (
                 final(self).overflow && final(self).content_eq(*old(self))
             ),
@@ -393,10 +393,8 @@ impl<const N: usize> TpmBuf<N> {
         let ghost old_data = self.data@;
         let ghost n_src = src@.len();
 
-        let mut i: usize = 0;
-        while i < src.len()
+        for i in 0..src.len()
             invariant
-                i <= src.len(),
                 src@.len() == n_src,
                 start == old(self).length,
                 start as int + n_src <= N as int,
@@ -410,19 +408,17 @@ impl<const N: usize> TpmBuf<N> {
                 forall|j: int| 0 <= j < i ==> self.data@[start + j] == src@[j],
                 forall|j: int| #![auto]
                     0 <= j < N && !(start <= j < start + n_src) ==> self.data@[j] == old_data[j],
-            decreases src.len() - i,
         {
-            let b: u8 = *slice_index_get(src, i);
+            let b: u8 = src[i];
             self.data[start + i] = b;
-            i = i + 1;
         }
 
         self.length = start + src.len();
         self.sync_length();
 
         proof {
-            // payload 起点在 hdr_len，sync_length 只动 [0, hdr_len)，
-            // 循环只动 [start, start + n_src)，两段不交叠。
+            // The payload starts at hdr_len, sync_length touches only [0, hdr_len),
+            // the loop touches only [start, start + n_src); the two ranges do not overlap.
             assert(self.payload() =~= old(self).payload() + src@);
         }
     }
@@ -529,7 +525,7 @@ impl<const N: usize> TpmBuf<N> {
         }
     }
 
-    /// 对应 `tpm_buf_append_handle()`。
+    /// Corresponds to `tpm_buf_append_handle()`.
     pub fn append_handle(&mut self, handle: u32) -> (r: bool)
         requires
             old(self).wf(),
@@ -560,15 +556,15 @@ impl<const N: usize> TpmBuf<N> {
             return false;
         }
         self.append_u32(handle);
-        self.handles = self.handles + 1;
+        self.handles += 1;
         true
     }
 
     // -----------------------------------------------------------------
-    // 读取
+    // Reading
     // -----------------------------------------------------------------
 
-    /// 对应 `tpm_buf_read_u8()`。
+    /// Corresponds to `tpm_buf_read_u8()`.
     pub fn read_u8(&mut self, offset: &mut usize) -> (r: u8)
         requires
             old(self).wf(),
@@ -592,12 +588,12 @@ impl<const N: usize> TpmBuf<N> {
             self.boundary_error = true;
             return 0;
         }
-        let v = *array_index_get(&self.data, *offset);
-        *offset = *offset + 1;
+        let v = self.data[*offset];
+        *offset += 1;
         v
     }
 
-    /// 对应 `tpm_buf_read_u16()`。
+    /// Corresponds to `tpm_buf_read_u16()`.
     pub fn read_u16(&mut self, offset: &mut usize) -> (r: u16)
         requires
             old(self).wf(),
@@ -625,13 +621,13 @@ impl<const N: usize> TpmBuf<N> {
             return 0;
         }
         let o = *offset;
-        let b0 = *array_index_get(&self.data, o);
-        let b1 = *array_index_get(&self.data, o + 1);
+        let b0 = self.data[o];
+        let b1 = self.data[o + 1];
         *offset = o + 2;
         be16_of_exec(b0, b1)
     }
 
-    /// 对应 `tpm_buf_read_u32()`。
+    /// Corresponds to `tpm_buf_read_u32()`.
     pub fn read_u32(&mut self, offset: &mut usize) -> (r: u32)
         requires
             old(self).wf(),
@@ -661,24 +657,31 @@ impl<const N: usize> TpmBuf<N> {
             return 0;
         }
         let o = *offset;
-        let b0 = *array_index_get(&self.data, o);
-        let b1 = *array_index_get(&self.data, o + 1);
-        let b2 = *array_index_get(&self.data, o + 2);
-        let b3 = *array_index_get(&self.data, o + 3);
+        let b0 = self.data[o];
+        let b1 = self.data[o + 1];
+        let b2 = self.data[o + 2];
+        let b3 = self.data[o + 3];
         *offset = o + 4;
         be32_of_exec(b0, b1, b2, b3)
     }
 
     // -----------------------------------------------------------------
-    // 访问器（`&self`，无 old/final 之分）
+    // Accessors (`&self`, no old/final distinction)
     // -----------------------------------------------------------------
 
-    /// 对应 `tpm_buf_length()`。
+    /// Corresponds to `tpm_buf_length()`.
     pub fn len(&self) -> (r: usize)
         ensures
             r as int == self.spec_len(),
     {
         self.length
+    }
+
+    pub fn is_empty(&self) -> (r: bool)
+        ensures
+            r == (self.spec_len() == 0),
+    {
+        self.length == 0
     }
 
     pub fn is_tpm2b(&self) -> (r: bool)
@@ -712,7 +715,7 @@ impl<const N: usize> TpmBuf<N> {
         self.handles
     }
 
-    /// 交给传输层的线上字节。**没有溢出时才有意义**，故要求 `!overflow`。
+    /// The on-wire bytes handed to the transport layer. **Meaningful only when there is no overflow**, hence `!overflow` is required.
     pub fn as_wire(&self) -> (r: &[u8])
         requires
             self.wf(),
@@ -721,7 +724,7 @@ impl<const N: usize> TpmBuf<N> {
             r@ =~= self.wire(),
             r@.len() == self.spec_len(),
     {
-        slice_subrange(array_as_slice(&self.data), 0, self.length)
+        &self.data[0..self.length]
     }
 }
 

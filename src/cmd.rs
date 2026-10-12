@@ -7,48 +7,48 @@ use crate::rsp::ALG_SHA256;
 
 verus! {
 
-// ===================== 命令码（TPM 2.0 Part 2 §6.5.2） =====================
+// ===================== Command codes (TPM 2.0 Part 2 §6.5.2) =====================
 
-pub const CC_SELF_TEST: u32 = 0x0000_0143;
-pub const CC_STARTUP: u32 = 0x0000_0144;
-pub const CC_SHUTDOWN: u32 = 0x0000_0145;
+pub(crate) const CC_SELF_TEST: u32 = 0x0000_0143;
+pub(crate) const CC_STARTUP: u32 = 0x0000_0144;
+pub(crate) const CC_SHUTDOWN: u32 = 0x0000_0145;
 pub const CC_CONTEXT_LOAD: u32 = 0x0000_0161;
-pub const CC_CONTEXT_SAVE: u32 = 0x0000_0162;
+pub(crate) const CC_CONTEXT_SAVE: u32 = 0x0000_0162;
 pub const CC_FLUSH_CONTEXT: u32 = 0x0000_0165;
 pub const CC_GET_CAPABILITY: u32 = 0x0000_017A;
-pub const CC_GET_RANDOM: u32 = 0x0000_017B;
-pub const CC_PCR_READ: u32 = 0x0000_017E;
-pub const CC_PCR_EXTEND: u32 = 0x0000_0182;
+pub(crate) const CC_GET_RANDOM: u32 = 0x0000_017B;
+pub(crate) const CC_PCR_READ: u32 = 0x0000_017E;
+pub(crate) const CC_PCR_EXTEND: u32 = 0x0000_0182;
 
-// ===================== 能力类别（Part 2 §6.12） =====================
+// ===================== Capability categories (Part 2 §6.12) =====================
 
 pub const CAP_HANDLES: u32 = 0x0000_0001;
 pub const CAP_COMMANDS: u32 = 0x0000_0002;
 pub const CAP_PCRS: u32 = 0x0000_0005;
-pub const CAP_TPM_PROPERTIES: u32 = 0x0000_0006;
+pub(crate) const CAP_TPM_PROPERTIES: u32 = 0x0000_0006;
 
-// ===================== 关机类型（Part 2 §6.9） =====================
+// ===================== Shutdown types (Part 2 §6.9) =====================
 
 pub const SU_CLEAR: u16 = 0x0000;
 pub const SU_STATE: u16 = 0x0001;
 
-// ===================== 平台参数 =====================
+// ===================== Platform parameters =====================
 
-/// PC Client 平台固定 24 个 PCR（TCG PC Client PFP）。
+/// The PC Client platform has a fixed 24 PCRs (TCG PC Client PFP).
 pub const PLATFORM_PCR: u32 = 24;
 
-/// 覆盖 24 个 PCR 所需的选择位图字节数：ceil(24 / 8)。
+/// Number of select-bitmap bytes needed to cover 24 PCRs: ceil(24 / 8).
 pub const PCR_SELECT_MIN: usize = 3;
 
-/// 单次取随机数的上限。超过这个量要分多次取。
+/// Upper limit for a single random-number request. Anything beyond it must be fetched in several requests.
 pub const MAX_RNG_DATA: u16 = 128;
 
-// ===================== PCR 选择位图 =====================
+// ===================== PCR select bitmap =====================
 
-/// 位号 `n`（0..8）对应的掩码值。
+/// The mask value for bit number `n` (0..8).
 ///
-/// 写成分支而不是移位：移位需要位向量求解器介入，而这里取值域只有
-/// 八个，直接枚举既显然又不给证明添负担。
+/// Written as branches rather than shifts: shifts need the bit-vector solver, while here the value domain has only
+/// eight elements, so enumerating them directly is both obvious and adds no burden to the proof.
 pub open spec fn spec_bit_value(n: u32) -> u8
     recommends
         n < 8,
@@ -98,25 +98,25 @@ fn bit_value(n: u32) -> (r: u8)
     }
 }
 
-/// 生成只选中单个 PCR 的选择位图。
+/// Generate a select bitmap that selects a single PCR only.
 ///
-/// 索引拆分用除法与取余而非移位与掩码：两者在 24 以内完全等价，
-/// 而除法形式可以直接进入整数推理，不必切换到位向量求解器。
-pub fn pcr_select_bitmap(pcr_idx: u32) -> (r: [u8; PCR_SELECT_MIN])
+/// The index is split with division and remainder rather than shift and mask: the two are fully equivalent below 24,
+/// and the division form goes straight into integer reasoning without switching to the bit-vector solver.
+fn pcr_select_bitmap(pcr_idx: u32) -> (r: [u8; PCR_SELECT_MIN])
     requires
         pcr_idx < PLATFORM_PCR,
     ensures
         r@.len() == PCR_SELECT_MIN,
-        // 选中位所在的那个字节非零
+        // the byte containing the selected bit is non-zero
         r@[(pcr_idx / 8) as int] == spec_bit_value(pcr_idx % 8),
         r@[(pcr_idx / 8) as int] != 0,
-        // 其余字节一律为零：位图里有且仅有一个 PCR 被选中
+        // all other bytes are zero: exactly one PCR is selected in the bitmap
         forall|k: int| 0 <= k < PCR_SELECT_MIN && k != pcr_idx / 8 ==> r@[k] == 0,
 {
     let byte_idx = pcr_idx / 8;
     let mask = bit_value(pcr_idx % 8);
 
-    // pcr_idx < 24 蕴含 byte_idx < 3，三分支已穷尽
+    // pcr_idx < 24 implies byte_idx < 3, so the three branches are exhaustive
     if byte_idx == 0 {
         [mask, 0, 0]
     } else if byte_idx == 1 {
@@ -126,14 +126,14 @@ pub fn pcr_select_bitmap(pcr_idx: u32) -> (r: [u8; PCR_SELECT_MIN])
     }
 }
 
-// ===================== PCR 句柄 =====================
+// ===================== PCR handles =====================
 
-/// PCR 的句柄值。
+/// The handle value of a PCR.
 ///
-/// PCR 的句柄类型编号为 0，因此句柄值就是 PCR 序号本身。单独成函数不是
-/// 为了那句 `r == pcr_idx`，而是为了带上这条注释：这一类句柄的「名字」
-/// 即句柄自身的四个字节，算命令摘要时不需要再去查任何名字表——写摘要
-/// 输入的那一处很容易在这里多绕一圈，绕错了不会被任何长度检查发现。
+/// The handle type number of a PCR is 0, so the handle value is the PCR index itself. It is a separate function not
+/// for the sake of `r == pcr_idx`, but to carry this comment: the "name" of this class of handle
+/// is the handle's own four bytes, so computing the command digest needs no name-table lookup -- the place that writes the digest
+/// input is prone to take an extra detour here, and a wrong detour would be caught by no length check.
 pub fn pcr_handle(pcr_idx: u32) -> (r: u32)
     requires
         pcr_idx < PLATFORM_PCR,
@@ -144,13 +144,13 @@ pub fn pcr_handle(pcr_idx: u32) -> (r: u32)
     pcr_idx
 }
 
-// ===================== 各命令载荷 =====================
+// ===================== Per-command payloads =====================
 
-/// `TPM2_PCR_Read` 载荷（Part 3 §22.4）。
+/// `TPM2_PCR_Read` payload (Part 3 §22.4).
 ///
 /// ```text
-/// count        u32 = 1        只问一个 bank
-/// hashAlg      u16            摘要算法
+/// count        u32 = 1        ask about a single bank only
+/// hashAlg      u16            digest algorithm
 /// sizeofSelect u8  = 3
 /// pcrSelect    u8[3]
 /// ```
@@ -171,32 +171,32 @@ pub fn pcr_read_payload(alg_id: u16, pcr_idx: u32) -> (r: [u8; 10])
     [cnt[0], cnt[1], cnt[2], cnt[3], alg[0], alg[1], PCR_SELECT_MIN as u8, sel[0], sel[1], sel[2]]
 }
 
-/// `TPM2_PCR_Extend` 的参数区长度：count(4) + hashAlg(2) + digest(32)。
+/// Length of the parameter area of `TPM2_PCR_Extend`: count(4) + hashAlg(2) + digest(32).
 pub const PCR_EXTEND_PARM_LEN: usize = 6 + SHA256_LEN;
 
-/// `TPM2_PCR_Extend` 的**参数区**（Part 3 §22.2）。
+/// The **parameter area** of `TPM2_PCR_Extend` (Part 3 §22.2).
 ///
 /// ```text
-/// count    u32 = 1        只写一个 bank
+/// count    u32 = 1        write a single bank only
 /// hashAlg  u16
 /// digest   u8[32]
 /// ```
 ///
-/// 这条命令与只读那条的形态不同，值得说清楚：它带一个句柄、且必须授权，
-/// 于是整条报文是
+/// This command differs in shape from the read-only one and deserves an explanation: it carries a handle and must be authorized,
+/// so the whole message is
 ///
 /// ```text
-/// 报文头 10 | pcrHandle 4 | authSize 4 | 授权区 | 参数区
+/// header 10 | pcrHandle 4 | authSize 4 | authorization area | parameter area
 /// ```
 ///
-/// 本函数只产出最后那一段。句柄不放进来是刻意的：句柄位于授权区**之前**，
-/// 而命令摘要覆盖的是授权区**之后**那一段。两者若混在同一个数组里，拼装方
-/// 迟早会把整块当作参数区喂给摘要——那种错误不触发任何长度检查，症状只是
-/// 校验恒不通过，排查起来要一路回溯到偏移的定义。
+/// This function produces only the last segment. Leaving the handle out is deliberate: the handle sits **before** the authorization area,
+/// while the command digest covers the segment **after** it. If the two were mixed in one array, the assembler
+/// would sooner or later feed the whole block to the digest as the parameter area -- an error that triggers no length check, whose only symptom is
+/// that verification never passes, and tracing it means walking all the way back to the offset definitions.
 ///
-/// 算法标识做成入参而不是写死的常量，是为了让前置条件把它和摘要长度绑在
-/// 一起：这里收的是定长 32 字节，声称成别的算法就是在报文里说了谎。想支持
-/// 第二种算法，摘要参数的类型必须同时改，改不动一半。
+/// The algorithm identifier is an input rather than a hard-coded constant so that the precondition can tie it to the digest length:
+/// this takes a fixed 32 bytes, and claiming another algorithm would be lying in the message. To support a
+/// second algorithm, the type of the digest parameter must change at the same time; changing only half is not possible.
 pub fn pcr_extend_payload(alg_id: u16, digest: &[u8; SHA256_LEN]) -> (r: [u8; PCR_EXTEND_PARM_LEN])
     requires
         alg_id == ALG_SHA256,
@@ -217,13 +217,11 @@ pub fn pcr_extend_payload(alg_id: u16, digest: &[u8; SHA256_LEN]) -> (r: [u8; PC
     out[4] = alg[0];
     out[5] = alg[1];
 
-    // 循环只写偏移 6 及以后，前缀两个字段原样保留。不变式按字节写而不是
-    // 直接背着两条大端等式走：前缀不变这件事是逐字节的，让求解器每轮重新
-    // 拆一次大端定义没有必要，收尾时拆一次就够。
-    let mut i: usize = 0;
-    while i < SHA256_LEN
+    // The loop writes only offset 6 onward; the two prefix fields are kept as they are. The invariant is stated per byte rather than
+    // carrying the two big-endian equations along: that the prefix is unchanged is a byte-by-byte fact, and making the solver
+    // unfold the big-endian definition again on every round is unnecessary; unfolding it once at the end is enough.
+    for i in 0..SHA256_LEN
         invariant
-            i <= SHA256_LEN,
             cnt@.len() == 4,
             alg@.len() == 2,
             spec_be32_at(cnt@, 0) == 1u32,
@@ -236,10 +234,8 @@ pub fn pcr_extend_payload(alg_id: u16, digest: &[u8; SHA256_LEN]) -> (r: [u8; PC
             out@[4] == alg@[0],
             out@[5] == alg@[1],
             forall|k: int| #![trigger out@[6 + k]] 0 <= k < i ==> out@[6 + k] == digest@[k],
-        decreases SHA256_LEN - i,
     {
-        out[6 + i] = *array_index_get(digest, i);
-        i = i + 1;
+        out[6 + i] = digest[i];
     }
 
     proof {
@@ -250,7 +246,7 @@ pub fn pcr_extend_payload(alg_id: u16, digest: &[u8; SHA256_LEN]) -> (r: [u8; PC
     out
 }
 
-/// `TPM2_GetCapability` 载荷（Part 3 §30.2）。
+/// `TPM2_GetCapability` payload (Part 3 §30.2).
 ///
 /// ```text
 /// capability     u32
@@ -270,10 +266,10 @@ pub fn get_capability_payload(capability: u32, property: u32, count: u32) -> (r:
     [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3]]
 }
 
-/// `TPM2_GetRandom` 载荷（Part 3 §16.1）。
+/// `TPM2_GetRandom` payload (Part 3 §16.1).
 ///
-/// 上限在类型层面挡住：一次要不到超过 `MAX_RNG_DATA` 的量，
-/// 调用方必须自己分批，而不是指望对端截断。
+/// The upper limit is enforced at the type level: no more than `MAX_RNG_DATA` can be requested at once,
+/// and the caller must batch the request itself rather than hope the peer truncates.
 pub fn get_random_payload(bytes_requested: u16) -> (r: [u8; 2])
     requires
         bytes_requested > 0,
@@ -285,7 +281,7 @@ pub fn get_random_payload(bytes_requested: u16) -> (r: [u8; 2])
     be16_bytes(bytes_requested)
 }
 
-/// `TPM2_Shutdown` 载荷（Part 3 §9.4）。
+/// `TPM2_Shutdown` payload (Part 3 §9.4).
 pub fn shutdown_payload(shutdown_type: u16) -> (r: [u8; 2])
     requires
         shutdown_type == SU_CLEAR || shutdown_type == SU_STATE,
@@ -296,7 +292,7 @@ pub fn shutdown_payload(shutdown_type: u16) -> (r: [u8; 2])
     be16_bytes(shutdown_type)
 }
 
-/// `TPM2_FlushContext` 载荷（Part 3 §28.4）。句柄在头部之后、无授权区。
+/// `TPM2_FlushContext` payload (Part 3 §28.4). The handle follows the header; there is no authorization area.
 pub fn flush_context_payload(handle: u32) -> (r: [u8; 4])
     ensures
         r@.len() == 4,

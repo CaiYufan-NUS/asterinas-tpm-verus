@@ -10,15 +10,15 @@ pub assume_specification [u32::to_le] (_0: u32) -> u32;
 pub assume_specification [core::hint::spin_loop] ();
 
 // ===========================================================================
-// 圈层 B：可信规约的落地
+// Ring B: grounding the trusted spec
 // ===========================================================================
 //
-// core 层不再直接持有裸指针，也不依赖任何平台 MMIO 库。这里改成「安全后端」：
-// 具体平台把寄存器读写能力实现成 `TisMmioBackend`，再交给本类型封装成 `TisPhy`。
-// 这样 core 侧不出现不安全代码，平台细节完全留在圈层 C / HAL。
+// The core layer no longer holds raw pointers directly, nor depends on any platform MMIO library. It now uses a "safe backend":
+// a concrete platform implements register read/write capability as `TisMmioBackend`, which this type wraps into a `TisPhy`.
+// This keeps unsafe code out of the core side, leaving platform details entirely in ring C / the HAL.
 
 // ---------------------------------------------------------------------------
-// 安全后端接口
+// Safe backend interface
 // ---------------------------------------------------------------------------
 
 pub trait TisMmioBackend {
@@ -29,19 +29,17 @@ pub trait TisMmioBackend {
     fn write8(&mut self, addr: u32, value: u8) -> Result<(), TisErr>;
 
     fn write32(&mut self, addr: u32, value: u32) -> Result<(), TisErr>;
-
-    fn delay(&mut self);
 }
 
 // ---------------------------------------------------------------------------
-// 寄存器窗口（后端适配）
+// Register window (backend adapter)
 // ---------------------------------------------------------------------------
 
 pub struct TisMmio<B: TisMmioBackend> {
     backend: B,
-    /// 每次 [`TisPhy::delay`] 空转的圈数。不是时长，真实间隔取决于目标 CPU 主频。
+    /// Number of spin iterations per [`TisPhy::delay`]. Not a duration; the real interval depends on the target CPU frequency.
     spin: u32,
-    /// 幽灵累积量，供 `phy.rs` 的规约引用。运行时零开销。
+    /// Ghost accumulator referenced by the specs in `phy.rs`. Zero runtime overhead.
     ghost written: Seq<u8>,
 }
 
@@ -61,7 +59,7 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
     }
 
     // -----------------------------------------------------------------------
-    // 寄存器
+    // Registers
     // -----------------------------------------------------------------------
 
     #[verifier::external_body]
@@ -71,7 +69,8 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
 
     #[verifier::external_body]
     fn read32(&mut self, addr: u32) -> (r: Result<u32, TisErr>) {
-        self.backend.read32(addr).map(|v| u32::from_le(v))
+        let v = self.backend.read32(addr)?;
+        Ok(u32::from_le(v))
     }
 
     #[verifier::external_body]
@@ -85,7 +84,7 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
     }
 
     // -----------------------------------------------------------------------
-    // 数据口
+    // Data port
     // -----------------------------------------------------------------------
 
     #[verifier::external_body]
@@ -93,27 +92,8 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
         (),
         TisErr,
     >) {
-        let out_len = out.len();
-        let mut i = 0usize;
-        while i < n
-            invariant
-                i <= n,
-                off + i <= out_len,
-                out_len == old(out).len(),
-            decreases n - i,
-        {
-            let idx = off + i;
-            if idx >= out_len {
-                return Err(TisErr::Phy);
-            }
-            match self.backend.read8(addr) {
-                Ok(b) => out[idx] = b,
-                Err(e) => return Err(e),
-            }
-            proof {
-                assert(off + (i + 1) <= out_len);
-            }
-            i += 1;
+        for slot in &mut out[off..off + n] {
+            *slot = self.backend.read8(addr)?;
         }
         Ok(())
     }
@@ -123,42 +103,13 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
         (),
         TisErr,
     >) {
-        let data_len = data.len();
-        let mut i = 0usize;
-        while i < n
-            invariant
-                i <= n,
-                off + i <= data_len,
-            decreases n - i,
-        {
-            let idx = off + i;
-            if idx >= data_len {
-                return Err(TisErr::Phy);
-            }
-            let byte = match data.get(idx) {
-                Some(v) => *v,
-                None => return Err(TisErr::Phy),
-            };
-            match self.backend.write8(addr, byte) {
-                Ok(()) => i += 1,
-                Err(e) => {
-                    proof {
-                        self.written = self.written + data@.subrange(off as int, idx as int);
-                    }
-                    return Err(e);
-                },
-            }
-            proof {
-                assert(off + (i + 1) <= data_len);
-            }
-        }
-        proof {
-            self.written = self.written + data@.subrange(off as int, off + n as int);
+        for &byte in &data[off..off + n] {
+            self.backend.write8(addr, byte)?;
         }
         Ok(())
     }
 
-    /// 写入 `TPM_STS_COMMAND_READY`（0x40）。
+    /// Write `TPM_STS_COMMAND_READY` (0x40).
     #[verifier::external_body]
     fn reset_fifo(&mut self, addr: u32) {
         let _ = self.backend.write8(addr, 0x40u8);
@@ -168,12 +119,14 @@ impl<B: TisMmioBackend> TisPhy for TisMmio<B> {
     }
 
     // -----------------------------------------------------------------------
-    // 节流
+    // Throttling
     // -----------------------------------------------------------------------
 
     #[verifier::external_body]
     fn delay(&mut self) {
-        self.backend.delay();
+        for _ in 0..self.spin {
+            core::hint::spin_loop();
+        }
     }
 }
 

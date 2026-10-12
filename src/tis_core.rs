@@ -10,25 +10,25 @@ use crate::tis::*;
 verus! {
 
 // ===========================================================================
-// 驱动状态
+// Driver state
 // ===========================================================================
 //
-// 只保留轮询路径。中断路径不在本层：中断处理器与命令路径并发访问同一组寄存
-// 器，要证下来得引入并发框架，成本按数倍估计；而本接口本来就带完整的轮询回
-// 退，砍掉中断不损失功能，只损失一点吞吐。
+// Only the polling path is kept. The interrupt path is not in this layer: the interrupt handler and the command path access the same set of registers
+// concurrently, proving that would require introducing a concurrency framework at several times the cost; and this interface already comes with a complete polling
+// fallback, so cutting interrupts loses no functionality, only a little throughput.
 //
-// 并发同样不在本层。所有方法都要求 `&mut Self` 独占引用，加锁由未验证的胶水
-// 层负责。这样「同一时刻只有一条命令在途」不是一条需要证明的性质，而是类型
-// 系统直接给出的事实。
+// Concurrency is likewise not in this layer. All methods require an exclusive `&mut Self` reference, and locking is done by the unverified glue
+// layer. Thus "only one command is in flight at a time" is not a property that needs proving, but a fact
+// given directly by the type system.
 
 pub struct Tis<P: TisPhy> {
     pub phy: P,
-    /// 本驱动使用的 locality 号。
+    /// The locality number used by this driver.
     pub locality: u8,
-    /// 是否已申请到 locality 且尚未归还。
+    /// Whether a locality has been acquired and not yet relinquished.
     ///
-    /// 这是本层唯一的持久状态。把它单列出来而不是每次去读器件，是因为要证的
-    /// 性质是「驱动自己有没有落下归还动作」，那属于本端的账，读器件读不出来。
+    /// This is the only persistent state of this layer. It is listed separately rather than read from the device each time, because the property to be proved
+    /// is "whether the driver itself dropped the relinquish action", which is this side's own bookkeeping and cannot be read from the device.
     pub held: bool,
 }
 
@@ -37,13 +37,13 @@ impl<P: TisPhy> Tis<P> {
         self.locality < MAX_LOCALITY
     }
 
-    /// 不持有 locality。
+    /// Does not hold the locality.
     pub open spec fn quiescent(self) -> bool {
         !self.held
     }
 
     // =======================================================================
-    // 寄存器读取
+    // Register reads
     // =======================================================================
 
     fn status(&mut self) -> (r: Result<u8, TisErr>)
@@ -59,10 +59,10 @@ impl<P: TisPhy> Tis<P> {
         self.phy.read8(addr)
     }
 
-    /// 轮询状态寄存器，直到 `mask` 里的位全部置起。
+    /// Poll the status register until all bits in `mask` are set.
     ///
-    /// 预算是轮询次数，`decreases` 直接用它——这就是把超时从时间域搬到次数域的
-    /// 全部收益：终止性不需要任何关于时钟的假设。
+    /// The budget is a poll count, and `decreases` uses it directly -- this is the whole benefit of moving timeouts from the time domain to the count domain:
+    /// termination needs no assumption about clocks.
     fn wait_status(&mut self, mask: u8, budget: u32) -> (r: Result<u8, TisErr>)
         requires
             old(self).wf(),
@@ -82,24 +82,21 @@ impl<P: TisPhy> Tis<P> {
                 self.phy.fifo_written() =~= old(self).phy.fifo_written(),
             decreases left,
         {
-            let s = match self.status() {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
+            let s = self.status()?;
             if (s & mask) == mask {
                 return Ok(s);
             }
             self.phy.delay();
-            left = left - 1;
+            left -= 1;
         }
         Err(TisErr::Timeout)
     }
 
-    /// 读取本轮可以连续搬运的字节数。
+    /// Read the number of bytes that can be transferred consecutively in this round.
     ///
-    /// 返回值保证非零。零意味着器件还没准备好，那种情况在这里表现为继续轮询
-    /// 或超时，而不是返回一个「搬零个字节」的成功——后者会让上层的搬运循环原
-    /// 地打转，且这个空转不会被任何超时预算兜住。
+    /// The return value is guaranteed non-zero. Zero means the device is not ready yet, which here shows up as continued polling
+    /// or a timeout, rather than a successful "transfer zero bytes" -- the latter would make the upper layer's transfer loop spin
+    /// in place, and that spinning would be caught by no timeout budget.
     fn burstcount(&mut self, budget: u32) -> (r: Result<u16, TisErr>)
         requires
             old(self).wf(),
@@ -120,17 +117,14 @@ impl<P: TisPhy> Tis<P> {
             decreases left,
         {
             let addr = reg_sts(self.locality);
-            let v = match self.phy.read32(addr) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
+            let v = self.phy.read32(addr)?;
             assert(((v >> 8u32) & 0xFFFFu32) <= 0xFFFFu32) by (bit_vector);
             let b = ((v >> 8u32) & 0xFFFFu32) as u16;
             if b >= 1 {
                 return Ok(b);
             }
             self.phy.delay();
-            left = left - 1;
+            left -= 1;
         }
         Err(TisErr::Timeout)
     }
@@ -139,11 +133,11 @@ impl<P: TisPhy> Tis<P> {
     // locality
     // =======================================================================
 
-    /// 器件是否已经把 locality 判给本端。
+    /// Whether the device has granted the locality to this side.
     ///
-    /// 三位一起看：仅 `ACTIVE` 置起不够，还要 `VALID` 置起表示寄存器内容有效，
-    /// 且 `REQUEST_USE` 已落下表示申请动作已经处理完。少看任何一位都会在竞争
-    /// 场景下把「申请正在处理中」误判成「已经拿到」。
+    /// All three bits are looked at together: `ACTIVE` alone is not enough; `VALID` must also be set to show the register contents are valid,
+    /// and `REQUEST_USE` must have dropped to show the request has been fully processed. Missing any one bit would, under contention,
+    /// mistake "the request is still being processed" for "already granted".
     fn check_locality(&mut self) -> (r: Result<bool, TisErr>)
         requires
             old(self).wf(),
@@ -154,19 +148,16 @@ impl<P: TisPhy> Tis<P> {
             final(self).phy.fifo_written() =~= old(self).phy.fifo_written(),
     {
         let addr = reg_access(self.locality);
-        let a = match self.phy.read8(addr) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let a = self.phy.read8(addr)?;
         let want = ACCESS_ACTIVE_LOCALITY | ACCESS_VALID;
         let mask = want | ACCESS_REQUEST_USE;
         Ok((a & mask) == want)
     }
 
-    /// 申请 locality。
+    /// Request the locality.
     ///
-    /// 失败时保证不持有——申请一半失败却把标志留成「持有」，会让后续的归还去
-    /// 释放一个从未拿到的资源。
+    /// On failure it is guaranteed not to be held -- if a request fails halfway but leaves the flag as "held", the later relinquish would
+    /// release a resource that was never obtained.
     pub fn request_locality(&mut self, budget: u32) -> (r: Result<(), TisErr>)
         requires
             old(self).wf(),
@@ -188,10 +179,7 @@ impl<P: TisPhy> Tis<P> {
         }
 
         let addr = reg_access(self.locality);
-        match self.phy.write8(addr, ACCESS_REQUEST_USE) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        self.phy.write8(addr, ACCESS_REQUEST_USE)?;
 
         let mut left = budget;
         while left > 0
@@ -211,16 +199,16 @@ impl<P: TisPhy> Tis<P> {
                 Err(e) => return Err(e),
             }
             self.phy.delay();
-            left = left - 1;
+            left -= 1;
         }
         Err(TisErr::Timeout)
     }
 
-    /// 归还 locality。
+    /// Relinquish the locality.
     ///
-    /// 无论寄存器写入成功与否，本端的持有标志都要清掉。写失败说明总线已经出了
-    /// 问题，此时把标志留成「持有」只会让驱动认定自己永远握着资源，再也不肯发
-    /// 起下一条命令——一个可恢复的总线故障因此变成永久性的功能丧失。
+    /// Whether or not the register write succeeds, this side's held flag must be cleared. A failed write means the bus already has
+    /// a problem, and leaving the flag as "held" would only make the driver believe it holds the resource forever and refuse to
+    /// issue the next command -- a recoverable bus fault would thereby become a permanent loss of function.
     pub fn relinquish_locality(&mut self)
         requires
             old(self).wf(),
@@ -236,14 +224,14 @@ impl<P: TisPhy> Tis<P> {
     }
 
     // =======================================================================
-    // 发送
+    // Sending
     // =======================================================================
 
-    /// 把命令送进数据口。
+    /// Push the command into the data port.
     ///
-    /// 成功时数据口收到的字节**恰好是命令本身**——不多不少，顺序一致。失败时
-    /// 数据口一定被清空，绝不会留下半条命令：器件那边若残留半条命令，下一次
-    /// 发送就会拼出一条谁也没写过的报文。
+    /// On success the bytes the data port received are **exactly the command itself** -- no more, no less, in the same order. On failure
+    /// the data port is always cleared and never left with half a command: if half a command remained in the device, the next
+    /// send would assemble a message that nobody wrote.
     pub fn send_data(&mut self, cmd: &[u8], len: usize) -> (r: Result<(), TisErr>)
         requires
             old(self).wf(),
@@ -285,23 +273,17 @@ impl<P: TisPhy> Tis<P> {
         let sts_addr = reg_sts(self.locality);
         let fifo_addr = reg_data_fifo(self.locality);
 
-        // 先确认器件处于命令就绪态。不就绪就中止当前命令再等——这一步同时把
-        // 上一条命令可能残留的字节清掉。
-        let s0 = match self.status() {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        // First confirm the device is in the command-ready state. If not ready, abort the current command and wait again -- this step also clears
+        // any bytes the previous command may have left behind.
+        let s0 = self.status()?;
         if (s0 & STS_COMMAND_READY) == 0 {
             self.phy.reset_fifo(sts_addr);
-            match self.wait_status(STS_COMMAND_READY, budget_of(TIMEOUT_B_MS)) {
-                Ok(_) => {},
-                Err(e) => return Err(e),
-            }
+            self.wait_status(STS_COMMAND_READY, budget_of(TIMEOUT_B_MS))?;
         }
 
-        // 末字节单独处理：写完它器件就认为命令收完，`DATA_EXPECT` 应当落下。
-        // 若把它混在循环里，「还要继续给」与「给够了」这两个判断就得共用一段
-        // 代码，而它们期望的状态位恰好相反。
+        // The last byte is handled separately: once it is written the device considers the command fully received, and `DATA_EXPECT` should drop.
+        // If it were mixed into the loop, the two judgments "keep feeding" and "fed enough" would have to share one piece of
+        // code, while the status bits they expect are exactly opposite.
         let last = len - 1;
         let mut count: usize = 0;
 
@@ -317,13 +299,10 @@ impl<P: TisPhy> Tis<P> {
                 self.phy.fifo_written() =~= cmd@.subrange(0, count as int),
             decreases last - count,
         {
-            let b = match self.burstcount(budget_of(TIMEOUT_A_MS)) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
+            let b = self.burstcount(budget_of(TIMEOUT_A_MS))?;
 
-            // 与剩余字节取小。器件报的可搬运量是它自己的缓冲余量，跟本次要发
-            // 的长度没有任何关系，不取小就会把 `cmd` 之外的内存读出去。
+            // Take the smaller of this and the remaining bytes. The transferable amount reported by the device is its own buffer slack, unrelated
+            // to the length to be sent this time; without taking the minimum, memory beyond `cmd` would be read out.
             let rem = last - count;
             let bs = b as usize;
             let n = if bs < rem {
@@ -332,10 +311,7 @@ impl<P: TisPhy> Tis<P> {
                 rem
             };
 
-            match self.phy.write_fifo(fifo_addr, cmd, count, n) {
-                Ok(()) => {},
-                Err(e) => return Err(e),
-            }
+            self.phy.write_fifo(fifo_addr, cmd, count, n)?;
 
             proof {
                 assert(cmd@.subrange(0, count as int) + cmd@.subrange(
@@ -344,46 +320,28 @@ impl<P: TisPhy> Tis<P> {
                 ) =~= cmd@.subrange(0, count + n));
             }
 
-            let next = match count.checked_add(n) {
-                Some(v) => v,
-                None => return Err(TisErr::Protocol),
-            };
+            let next = count.checked_add(n).ok_or(TisErr::Protocol)?;
             count = next;
 
-            match self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS)) {
-                Ok(_) => {},
-                Err(e) => return Err(e),
-            }
-            let s1 = match self.status() {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
-            // 还没写完，器件必须表示还要继续收。
+            self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS))?;
+            let s1 = self.status()?;
+            // Not finished writing yet; the device must indicate it expects more.
             if (s1 & STS_DATA_EXPECT) == 0 {
                 return Err(TisErr::Protocol);
             }
         }
 
-        // 末字节
-        match self.phy.write_fifo(fifo_addr, cmd, count, 1) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        // Last byte
+        self.phy.write_fifo(fifo_addr, cmd, count, 1)?;
         proof {
             assert(cmd@.subrange(0, last as int) + cmd@.subrange(last as int, last + 1)
                 =~= cmd@.subrange(0, len as int));
         }
 
-        match self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS)) {
-            Ok(_) => {},
-            Err(e) => return Err(e),
-        }
-        let s2 = match self.status() {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        // 写完了，器件必须表示不再要更多——还要更多说明双方对命令长度的理解
-        // 不一致，此时发令等于让器件去执行一条被截断的命令。
+        self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS))?;
+        let s2 = self.status()?;
+        // Finished writing; the device must indicate it wants no more -- wanting more shows the two sides understand the command length
+        // differently, and issuing the go command then would make the device execute a truncated command.
         if (s2 & STS_DATA_EXPECT) != 0 {
             return Err(TisErr::Protocol);
         }
@@ -392,10 +350,10 @@ impl<P: TisPhy> Tis<P> {
     }
 
     // =======================================================================
-    // 接收
+    // Receiving
     // =======================================================================
 
-    /// 从数据口取 `count` 字节到 `out[off..]`。
+    /// Take `count` bytes from the data port into `out[off..]`.
     fn recv_data(&mut self, out: &mut [u8], off: usize, count: usize) -> (r: Result<(), TisErr>)
         requires
             old(self).wf(),
@@ -427,17 +385,11 @@ impl<P: TisPhy> Tis<P> {
                     0 <= k < out.len() && (k < off || k >= off + count) ==> out@[k] == old(out)@[k],
             decreases count - got,
         {
-            match self.wait_status(STS_DATA_AVAIL | STS_VALID, budget_of(TIMEOUT_C_MS)) {
-                Ok(_) => {},
-                Err(e) => return Err(e),
-            }
+            self.wait_status(STS_DATA_AVAIL | STS_VALID, budget_of(TIMEOUT_C_MS))?;
 
-            let b = match self.burstcount(budget_of(TIMEOUT_A_MS)) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
+            let b = self.burstcount(budget_of(TIMEOUT_A_MS))?;
 
-            // 同样与剩余字节取小。这里不取小的后果是直接写出接收缓冲区之外。
+            // Likewise take the smaller of this and the remaining bytes. Not doing so would directly write beyond the receive buffer.
             let rem = count - got;
             let bs = b as usize;
             let n = if bs < rem {
@@ -446,43 +398,37 @@ impl<P: TisPhy> Tis<P> {
                 rem
             };
 
-            // 在 read_fifo 修改 out 之前，把循环不变量固化到 out_pre。
+            // Before read_fifo modifies out, fix the loop invariant into out_pre.
             let ghost out_pre = out@;
 
-            match self.phy.read_fifo(fifo_addr, out, off + got, n) {
-                Ok(()) => {},
-                Err(e) => return Err(e),
-            }
+            self.phy.read_fifo(fifo_addr, out, off + got, n)?;
 
-            // 重建循环不变量。read_fifo 保证 k < off+got 或 k >= off+got+n 时 out@[k] == out_pre[k]。
-            // 而 n <= rem = count-got，所以 off+got+n <= off+count，即条件 k >= off+count 时自动满足。
-            // 条件 k < off 同样由 k < off+got 蕴含。故 out@[k] == out_pre[k] == old(out)@[k]。
+            // Re-establish the loop invariant. read_fifo guarantees out@[k] == out_pre[k] when k < off+got or k >= off+got+n.
+            // And n <= rem = count-got, so off+got+n <= off+count, i.e. the condition k >= off+count is satisfied automatically.
+            // The condition k < off is likewise implied by k < off+got. Hence out@[k] == out_pre[k] == old(out)@[k].
             proof {
                 assert forall|k: int|
                     #![trigger out@[k]]
                     0 <= k < out.len() && (k < off || k >= off + count)
                         implies out@[k] == old(out)@[k]
                 by {
-                    // Verus 需要看到 out@[k] == out_pre[k]（来自 read_fifo）和 out_pre[k] == old(out)@[k]（来自循环不变量）
-                    assert(out_pre[k] == old(out)@[k]);  // 触发旧循环不变量（触发器 out_pre[k]）
-                    assert(n <= count - got);            // 边界关系
+                    // Verus needs to see out@[k] == out_pre[k] (from read_fifo) and out_pre[k] == old(out)@[k] (from the loop invariant)
+                    assert(out_pre[k] == old(out)@[k]);  // trigger the old loop invariant (trigger out_pre[k])
+                    assert(n <= count - got);            // bounds relation
                 };
             }
 
-            let next = match got.checked_add(n) {
-                Some(v) => v,
-                None => return Err(TisErr::Protocol),
-            };
+            let next = got.checked_add(n).ok_or(TisErr::Protocol)?;
             got = next;
         }
         Ok(())
     }
 
-    /// 收取一条完整响应，返回其字节数。
+    /// Receive one complete response and return its byte count.
     ///
-    /// 返回值同时是**下一层解码的入口条件**：成功时 `out[0..n]` 的长度字段与
-    /// `n` 相等，也就是满足报文层的格式良好性。解码层因此不必再校验一遍长度，
-    /// 两层对「一条响应有多长」的理解由这条后置条件焊死。
+    /// The return value is also **the entry condition of the next layer's decoding**: on success the length field of `out[0..n]` equals
+    /// `n`, i.e. it satisfies the message layer's well-formedness. The decoding layer therefore need not validate the length again, and
+    /// the two layers' understanding of "how long a response is" is welded together by this postcondition.
     pub fn recv(&mut self, out: &mut [u8]) -> (r: Result<usize, TisErr>)
         requires
             old(self).wf(),
@@ -499,20 +445,14 @@ impl<P: TisPhy> Tis<P> {
                 &&& spec_be32_at(final(out)@, 2) == n
             },
     {
-        // 先取报文头。长度字段在里面，取到之前无从知道还要收多少。
-        match self.recv_data(out, 0, TPM_HEADER_LEN) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        // Take the message header first. The length field is in it, and before it is read there is no way to know how much more to receive.
+        self.recv_data(out, 0, TPM_HEADER_LEN)?;
 
         let mut c = Cursor::at(2);
-        let expected = match c.read_be32(&*out) {
-            Some(v) => v,
-            None => return Err(TisErr::BadLength),
-        };
+        let expected = c.read_be32(&*out).ok_or(TisErr::BadLength)?;
 
-        // 长度字段完全由对端给出，两侧都要卡死：小于一个报文头说明它连自己的
-        // 头都装不下，大于缓冲区说明再收下去就要越界。
+        // The length field is given entirely by the peer, so both sides must be pinned down: smaller than a message header means it cannot even hold its own
+        // header, and larger than the buffer means receiving further would go out of bounds.
         let n = expected as usize;
         if n < TPM_HEADER_LEN {
             return Err(TisErr::BadLength);
@@ -525,12 +465,9 @@ impl<P: TisPhy> Tis<P> {
 
         assert(n >= TPM_HEADER_LEN);
         assert(n <= out.len());
-        match self.recv_data(out, TPM_HEADER_LEN, n - TPM_HEADER_LEN) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        self.recv_data(out, TPM_HEADER_LEN, n - TPM_HEADER_LEN)?;
 
-        // 第二段落在报文头之后，长度字段所在的四个字节没被动过。
+        // The second segment lands after the message header; the four bytes holding the length field were not touched.
         proof {
             assert(out@[2] == after_hdr[2]);
             assert(out@[3] == after_hdr[3]);
@@ -542,17 +479,11 @@ impl<P: TisPhy> Tis<P> {
             assert(spec_be32_at(out@, 2) == n);
         }
 
-        match self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS)) {
-            Ok(_) => {},
-            Err(e) => return Err(e),
-        }
-        let s = match self.status() {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        // 还有数据可读说明器件准备的响应比它自己声明的长。多出来的部分是什么
-        // 无从判断，只能整条作废——按声明长度截断会让上层收到一条被裁过的报文
-        // 却毫无察觉。
+        self.wait_status(STS_VALID, budget_of(TIMEOUT_C_MS))?;
+        let s = self.status()?;
+        // Readable data remaining means the response the device prepared is longer than it declared. What the extra part is
+        // cannot be judged, so the whole response is voided -- truncating at the declared length would hand the upper layer a trimmed message
+        // without it noticing.
         if (s & STS_DATA_AVAIL) != 0 {
             return Err(TisErr::Protocol);
         }
@@ -561,16 +492,22 @@ impl<P: TisPhy> Tis<P> {
     }
 
     // =======================================================================
-    // 一次完整往返
+    // One complete round trip
     // =======================================================================
 
-    /// 发一条命令，收一条响应。
+    /// Send a command and receive a response.
     ///
-    /// **locality 的归还只有一处，而且不在任何条件分支里。** 申请之后立刻把全
-    /// 部可能失败的动作收进一个内部函数，让归还成为无条件的收尾语句——于是
-    /// 「任何路径退出时 locality 均被释放」不需要逐条路径去查，它是控制流的形
-    /// 状直接给出的。这也是本层唯一一处刻意为了可证性而调整的结构。
-    pub fn transmit(&mut self, cmd: &[u8], len: usize, out: &mut [u8]) -> (r: Result<usize, TisErr>)
+    /// **There is exactly one place that relinquishes the locality, and it is not inside any conditional branch.** Right after the request, all
+    /// actions that may fail are gathered into an inner function, making the relinquish an unconditional closing statement -- so
+    /// "the locality is released on exit from any path" needs no path-by-path check; it is given directly by the shape of the
+    /// control flow. This is also the only place in this layer where the structure was deliberately adjusted for provability.
+    pub fn transmit(
+        &mut self,
+        cmd: &[u8],
+        len: usize,
+        out: &mut [u8],
+        exec_budget: u32,
+    ) -> (r: Result<usize, TisErr>)
         requires
             old(self).wf(),
             old(self).quiescent(),
@@ -579,7 +516,7 @@ impl<P: TisPhy> Tis<P> {
             TPM_HEADER_LEN <= old(out).len(),
         ensures
             final(self).wf(),
-            // ★ 成功、失败、超时，三种出口都不再持有 locality
+            // ★ All three exits -- success, failure, timeout -- no longer hold the locality
             final(self).quiescent(),
             final(self).locality == old(self).locality,
             final(out).len() == old(out).len(),
@@ -589,17 +526,20 @@ impl<P: TisPhy> Tis<P> {
                 &&& spec_be32_at(final(out)@, 2) == n
             },
     {
-        match self.request_locality(budget_of(TIMEOUT_A_MS)) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        self.request_locality(budget_of(TIMEOUT_A_MS))?;
 
-        let res = self.exchange(cmd, len, out);
+        let res = self.exchange(cmd, len, out, exec_budget);
         self.relinquish_locality();
         res
     }
 
-    fn exchange(&mut self, cmd: &[u8], len: usize, out: &mut [u8]) -> (r: Result<usize, TisErr>)
+    fn exchange(
+        &mut self,
+        cmd: &[u8],
+        len: usize,
+        out: &mut [u8],
+        exec_budget: u32,
+    ) -> (r: Result<usize, TisErr>)
         requires
             old(self).wf(),
             old(self).held,
@@ -619,15 +559,12 @@ impl<P: TisPhy> Tis<P> {
     {
         let sts_addr = reg_sts(self.locality);
 
-        // 进场先清干净，不假设上一次是怎么退出的。
+        // Clear everything on entry, without assuming how the last run exited.
         self.phy.reset_fifo(sts_addr);
 
-        match self.send_data(cmd, len) {
-            Ok(()) => {},
-            Err(e) => return Err(e),
-        }
+        self.send_data(cmd, len)?;
 
-        // 发令。到这一步器件才开始执行。
+        // Issue the go command. Only at this step does the device start executing.
         match self.phy.write8(sts_addr, STS_GO) {
             Ok(()) => {},
             Err(e) => {
@@ -636,9 +573,8 @@ impl<P: TisPhy> Tis<P> {
             },
         }
 
-        // 等待响应就绪。这里用的是统一的长超时；按命令码区分执行时长是一项
-        // 独立的优化，它需要一张命令到时长的表，不影响本层的任何性质。
-        match self.wait_status(STS_DATA_AVAIL | STS_VALID, budget_of(TIMEOUT_B_MS)) {
+        // Wait for the response to become ready. The budget is converted from the command code by the caller and passed in.
+        match self.wait_status(STS_DATA_AVAIL | STS_VALID, exec_budget) {
             Ok(_) => {},
             Err(e) => {
                 self.phy.reset_fifo(sts_addr);
@@ -654,7 +590,7 @@ impl<P: TisPhy> Tis<P> {
             },
         };
 
-        // 收完主动中止，让器件回到命令就绪态。
+        // After receiving, actively abort so the device returns to the command-ready state.
         self.phy.reset_fifo(sts_addr);
         Ok(n)
     }
